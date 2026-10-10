@@ -28,15 +28,18 @@ type upstream struct {
 
 // recordedRequest 是一次上游调用的留档。
 type recordedRequest struct {
-	Path string
-	Body []byte
+	Path   string
+	Body   []byte
+	Header http.Header
 }
 
 // record 记录一次调用。
 func (u *upstream) record(request *http.Request) []byte {
 	body, _ := io.ReadAll(request.Body)
+	// 头要复制一份：httptest 会把 request 还回连接池，留着原 map 会跟着变。
+	header := request.Header.Clone()
 	u.mu.Lock()
-	u.requests = append(u.requests, recordedRequest{Path: request.URL.Path, Body: body})
+	u.requests = append(u.requests, recordedRequest{Path: request.URL.Path, Body: body, Header: header})
 	u.mu.Unlock()
 	return body
 }

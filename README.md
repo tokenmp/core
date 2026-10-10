@@ -118,6 +118,22 @@ service, err := server.FromConfigWith(cfg, logger, server.WithoutAccessLog(),
 层的控制：加响应头、换请求体、自己裹 `ResponseWriter`、往 context 里放请求级的
 记账状态。
 
+宿主按请求给上游加头，在同一个中间件里调 `WithUpstreamHeader`：
+
+```go
+server.WithMiddleware(func(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        ctx := server.WithUpstreamHeader(r.Context(), "X-Trace-ID", traceID(r))
+        next.ServeHTTP(w, r.WithContext(ctx))
+    })
+})
+```
+
+它是按请求给上游加头的唯一入口：客户端自带的请求头不会被转发，因此只有在这里
+明确设置的头才会上去。与渠道配置里的同名头按请求覆盖，请求级比渠道级更具体，
+而覆盖是显式的，宿主没设的同名头照旧上去。渠道的鉴权头由 `Auth` 最后写入，
+宿主设的同名头不生效，凭据始终来自渠道。同一个名字重复设置时后一次生效。
+
 `WithoutAccessLog()` 关掉内核自己那两行，避免与宿主的记录重复；关掉之后进入行里的
 `client` 与 `user_agent` 也一起没有，需要的话从 `Outcome` 的同名字段自己记。
 
@@ -128,8 +144,9 @@ service, err := server.FromConfigWith(cfg, logger, server.WithoutAccessLog(),
   宿主在 pre/post 里直接在原 writer 上写、或先设了状态码，不进入 `Outcome`。
 - 中间件不调用 `next` 时内核整个不参与：没有访问日志、没有回调，
   那条请求由宿主自己记账。
-- 改请求头不会传到上游 —— 上游请求头来自渠道配置，内核不从进来的请求里抄。
-  请求体可以换：内核从 `request.Body` 读，换过之后参与路由的就是新内容。
+- 改请求头不会传到上游 —— 上游请求头来自渠道配置与 `Auth`，内核不从进来的请求里抄；
+  要按请求加上游头，用 `WithUpstreamHeader`。请求体可以换：内核从 `request.Body` 读，
+  换过之后参与路由的就是新内容。
 
 只用转换内核、不起服务也是支持的：
 

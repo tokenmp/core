@@ -105,7 +105,10 @@ type Request struct {
 	Stream bool
 	// Body 是请求体，会被完整缓存在内存里，因此可以重试。
 	Body []byte
-	// Header 是附加请求头。
+	// Header 是请求级请求头，同名时覆盖 Spec.Headers 里的值。
+	//
+	// 覆盖是请求级比渠道级更具体的结果：同一个头只发一条，不会两条并存。
+	// 渠道的鉴权头不在此列，它在最后按 Auth 写入。
 	Header http.Header
 }
 
@@ -170,6 +173,9 @@ func (c *Client) attempt(ctx context.Context, method, endpoint string, req Reque
 		request.Header.Set(key, value)
 	}
 	for key, values := range req.Header {
+		// 先清掉渠道配置的同名值再写：只用 Add 会让同名头在线上出现两条，
+		// 上游取第一条就等于渠道配置压过请求级，那不是调用方传 Header 的意图。
+		request.Header.Del(key)
 		for _, value := range values {
 			request.Header.Add(key, value)
 		}

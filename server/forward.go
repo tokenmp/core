@@ -114,6 +114,8 @@ func (s *Server) callUpstream(
 	body []byte,
 	routes []config.Route,
 ) (*http.Response, *relay.Prepared, config.Route) {
+	// 宿主按请求设的上游头只取一次，候选换渠道时不变。
+	headers := s.upstreamHeaders(ctx)
 	var lastMessage string
 	for index, route := range routes {
 		started := s.now()
@@ -142,6 +144,7 @@ func (s *Server) callUpstream(
 			Model:   route.Upstream,
 			Stream:  prepared.Stream,
 			Body:    prepared.Body,
+			Header:  headers,
 		})
 		if err != nil {
 			lastMessage = err.Error()

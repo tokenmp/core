@@ -63,6 +63,7 @@ type Options struct {
 	// 装在外侧：宿主加进 context 的值会一路传下去，OnRequestDone 的 ctx 里有它。
 	//
 	// 改请求头不会传到上游：上游请求头来自渠道配置与 `Auth`，内核不从进来的请求里抄。
+	// 要按请求加上游头，在中间件里调 WithUpstreamHeader 往 ctx 上挂。
 	//
 	// 包装 http.ResponseWriter 时必须把 Flush 转发下去，否则流式响应会静默退化成
 	// 不刷新。
