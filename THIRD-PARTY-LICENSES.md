@@ -1,6 +1,10 @@
 # 第三方许可
 
-本仓库的运行时依赖清单。版本以 `go.mod` 为准，测试与工具依赖不在此列。
+本仓库的依赖清单。版本以 `go.mod` 为准。
+
+## 运行时依赖
+
+这些模块会被编译进本模块，使用者按依赖关系装取。
 
 | 模块 | 版本 | 许可 |
 | --- | --- | --- |
@@ -14,6 +18,16 @@
 | github.com/tidwall/sjson | v1.2.5 | MIT |
 | golang.org/x/text | v0.35.0 | BSD-3-Clause |
 | gopkg.in/yaml.v3 | v3.0.1 | MIT 与 Apache-2.0 双许可 |
+
+## 只出现在 go.mod 里的测试依赖
+
+`go.mod` 还记着 `github.com/kr/text v0.2.0`。它不属于本模块的编译图，
+`go list -deps ./...` 里找不到它。它被记下来是因为 `gopkg.in/yaml.v3` 自己的测试
+依赖链要经过它，而 go 的模块裁剪会把它算进 `go.mod`。许可是 MIT，
+版权归 Keith Rarick（2012）。
+
+`go list -m all` 还会列出更多模块，那些是上面这些模块自己的测试与工具依赖，
+使用者装取本模块时不会被下载，因此不在这里逐条登记。
 
 ## 版权行
 
@@ -54,6 +68,10 @@ gopkg.in/yaml.v3
   Copyright (c) 2006-2011 Kirill Simonov
   Copyright (c) 2011-2019 Canonical Ltd
   MIT License 与 Apache License 2.0 双许可
+
+github.com/kr/text
+  Copyright 2012 Keith Rarick
+  MIT License
 ```
 
 ## 说明
