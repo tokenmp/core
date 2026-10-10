@@ -38,6 +38,30 @@ func TestOrderIsDeterministic(t *testing.T) {
 	}
 }
 
+// TestOrderIgnoresInputOrder 确认候选在入参里的排列不影响结果。
+//
+// 这条比重复调用同一份入参有信息量：候选顺序变了结果还不变，说明排序由分数决定，
+// 不会被 sort 的稳定性或入参顺序带偏。
+func TestOrderIgnoresInputOrder(t *testing.T) {
+	base := []string{"a", "b", "c", "d"}
+	rotations := [][]string{
+		{"b", "c", "d", "a"},
+		{"c", "d", "a", "b"},
+		{"d", "a", "b", "c"},
+		{"d", "c", "b", "a"},
+	}
+	for _, rotation := range rotations {
+		for index := range 100 {
+			key := fmt.Sprintf("sess-%d", index)
+			want := Pick(key, base)
+			if got := Pick(key, rotation); got != want {
+				t.Fatalf("会话 %s 在入参顺序 %v 下选中 %s，在 %v 下选中 %s",
+					key, base, want, rotation, got)
+			}
+		}
+	}
+}
+
 // TestOrderIsEmpty 确认空候选不报错。
 func TestOrderIsEmpty(t *testing.T) {
 	if order := Order("sess-1", nil); len(order) != 0 {
@@ -103,20 +127,33 @@ func TestRemovingIdentityOnlyMovesItsOwnShares(t *testing.T) {
 }
 
 // TestAddedIdentityOnlyTakesItsOwnShares 确认新增渠道只从已有渠道各取一份。
+//
+// 精确性质有两条：换渠道的会话必须全部是转投新渠道的那些，而且新渠道拿到的份额
+// 应当是总量的 1/(n+1) 量级。只断言「换了一批」不足以说明分配是对的。
 func TestAddedIdentityOnlyTakesItsOwnShares(t *testing.T) {
 	before := []string{"a", "b", "c"}
-	after := []string{"a", "b", "c", "d"}
-	const total = 2000
+	added := "d"
+	after := []string{"a", "b", "c", added}
+	const total = 4000
 
 	moved := 0
+	landedOnAdded := 0
 	for index := range total {
 		key := fmt.Sprintf("sess-%d", index)
-		if Pick(key, before) != Pick(key, after) {
+		previous := Pick(key, before)
+		current := Pick(key, after)
+		if current == added {
+			landedOnAdded++
+		}
+		if previous != current {
 			moved++
 		}
 	}
-	// 新渠道应当吃掉大约四分之一的会话，允许较大偏差，只要求它是这个量级。
-	if moved < total/8 || moved > total/2 {
-		t.Fatalf("新增渠道后换渠道的会话有 %d 个，不在总量的 1/8 到 1/2 之间", moved)
+	if moved != landedOnAdded {
+		t.Fatalf("换渠道的会话 %d 个，转投新渠道的只有 %d 个", moved, landedOnAdded)
+	}
+	want := total / len(after)
+	if landedOnAdded < want-want/5 || landedOnAdded > want+want/5 {
+		t.Fatalf("新渠道拿到 %d 个会话，期望 %d 上下浮动 %d", landedOnAdded, want, want/5)
 	}
 }

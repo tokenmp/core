@@ -79,14 +79,15 @@ type Auth struct {
 // Model 是一条模型路由规则。Match 支持 * 通配，同一个模型可以有多条规则，
 // 按配置顺序依次尝试。
 //
-// Affinity 打开同一模型多条规则之间的渠道亲和。只要命中该模型的规则里有一条
-// 打开它，这个模型的候选路由就参与亲和分配。只有一条候选时亲和不起作用。
+// Affinity 是渠道亲和的组名。命中该模型的规则里，组名相同的候选组成一个池，
+// 池里的渠道被当作可互换的；同一段会话的连续请求会在池内粘住一条，池外的候选
+// 按配置顺序排在池后面兜底。留空表示不参与。
 type Model struct {
 	Match    string `yaml:"match"`
 	Channel  string `yaml:"channel"`
 	Upstream string `yaml:"upstream"`
 	Dialect  string `yaml:"dialect"`
-	Affinity bool   `yaml:"affinity"`
+	Affinity string `yaml:"affinity"`
 }
 
 // Plugin 是一个插件的启用状态与顺序。
@@ -109,8 +110,8 @@ type Route struct {
 	Channel  string
 	Upstream string
 	Dialect  dialect.Name
-	// Affinity 取自语规则，表示这条候选参与渠道亲和。
-	Affinity bool
+	// Affinity 取自语规则，是这条候选所属的亲和组名，空串表示不参与。
+	Affinity string
 }
 
 // ChannelByName 按名字取渠道配置。

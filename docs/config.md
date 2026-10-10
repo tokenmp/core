@@ -69,7 +69,7 @@ plugins:
 | `channels[].timeout` | `120s` | 单次上游请求的整体超时 |
 | `channels[].max_retries` | `0` | 失败后的重试次数 |
 | `channels[].path` | 按方言 | 覆盖上游路径 |
-| `models[].affinity` | `false` | 是否让同一段会话粘在同一个渠道上 |
+| `models[].affinity` | 空 | 渠道亲和的组名，留空表示不参与 |
 | `plugins.dir` | `plugins` | 插件目录 |
 | `plugins.list[].order` | `0` | 执行顺序，越小越先执行 |
 | 请求体上限 | `32 MiB` | 客户端请求体的字节上限，不是配置项 |
@@ -129,16 +129,18 @@ routes := cfg.Resolve("gpt-4o")
 同一个模型配了多条候选渠道时，可以让同一段会话的连续请求粘在同一个渠道上。
 上游的提示缓存按账号隔离，会话换渠道就意味着缓存要重建，粘住能省钱。
 
-在模型规则上加 `affinity: true` 就是打开：
+组名相同的候选组成一个池，池里的渠道被当作可互换的：
 
 ```yaml
 models:
-  - {match: "claude-*", channel: account-a, affinity: true}
-  - {match: "claude-*", channel: account-b}
+  - {match: "claude-*", channel: account-a, affinity: accounts}
+  - {match: "claude-*", channel: account-b, affinity: accounts}
+  - {match: "*",        channel: fallback}
 ```
 
-命中同一个模型的规则里只要有一条打开它，这个模型的候选就参与分配。
-只有一条候选时亲和不起作用。
+请求先在池里按会话标识选一条，池外的候选保持配置顺序，排在池后面兜底。
+上例里 `fallback` 没有写组名，因此它只当降级路径，不会被选成首选。
+池里只有一个成员时亲和不起作用，行为等于配置顺序。
 
 会话标识按下面的顺序取，取到第一个非空的：
 
@@ -151,7 +153,9 @@ models:
 进程重启不变，多实例部署也一致。
 
 亲和是偏好而不是钉子。粘住的渠道失败时后面的候选照旧兜底，
-渠道上下线也只影响原本落在它上面的那部分会话。
+但只覆盖连接错误、408、401、403、429 与 5xx 这几种。
+上游返回 400、404、422 时不会换渠道，因为那说明请求本身有问题，
+换渠道也不会变好。
 
 三件要知道的限制：
 
@@ -159,4 +163,5 @@ models:
   它们本来就共享缓存，此时亲和只是多了一层分配，不带来额外收益。
 - 上游的机器落点不归 core 管。OpenAI 的文档写明缓存状态在单台机器上，
   每分钟超过 15 个请求会触发 overflow routing，即使渠道固定也可能落空。
-- 会话标识只在本进程内使用，不会写进上游报文。
+- 请求头里的标识只在本进程内使用，不会转发给上游。
+  从 `prompt_cache_key` 取的标识属于请求体，OpenAI 转 OpenAI 时会原样送上去。

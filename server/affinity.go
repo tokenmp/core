@@ -17,17 +17,24 @@ import (
 // 的提示缓存有机会命中。这个头只在本进程内使用，不会转发给上游。
 const SessionHeaderName = "X-TokenMP-Session"
 
-// affinityRoutes 按会话标识重排候选路由，粘住的那条排到最前。
+// minPoolSize 是亲和池起作用所需的最少成员数。只有一条候选时没有可分配的对象。
+const minPoolSize = 2
+
+// affinityRoutes 按会话标识重排候选路由。
 //
-// 只重排，不筛选：粘住的渠道失败时，后面的候选照旧按原顺序兜底。因此亲和是偏好
-// 而不是钉子，渠道不可用时不会把请求卡在那里。
+// 池内按 rendezvous 哈希定序，粘住的那条排到最前；池外的候选保持配置顺序，
+// 排在池后面。只重排，不筛选：粘住的渠道失败时，后面的候选照旧按这个顺序兜底。
+// 因此亲和是偏好而不是钉子，渠道不可用时不会把请求卡在那里。
 func (s *Server) affinityRoutes(
 	request *http.Request,
 	client dialect.Name,
 	body []byte,
 	routes []config.Route,
 ) []config.Route {
-	if len(routes) < 2 || !anyAffinity(routes) {
+	pool := affinityPool(routes)
+	if len(pool) < minPoolSize {
+		// 池里只有一个成员时亲和没有可分配的对象，保持配置顺序。
+		// 这也让「只给一条规则写了组名」回到什么都不做的保守行为。
 		return routes
 	}
 	key := sessionKey(request, client, body)
@@ -36,14 +43,23 @@ func (s *Server) affinityRoutes(
 		// 不做猜测，保持配置顺序。
 		return routes
 	}
-	identities := make([]string, len(routes))
-	for index, route := range routes {
-		identities[index] = routeIdentity(route)
+	identities := make([]string, len(pool))
+	for position, index := range pool {
+		identities[position] = routeIdentity(routes[index])
 	}
 	order := affinity.Order(key, identities)
 	reordered := make([]config.Route, 0, len(routes))
-	for _, index := range order {
-		reordered = append(reordered, routes[index])
+	for _, position := range order {
+		reordered = append(reordered, routes[pool[position]])
+	}
+	inPool := make(map[int]bool, len(pool))
+	for _, index := range pool {
+		inPool[index] = true
+	}
+	for index, route := range routes {
+		if !inPool[index] {
+			reordered = append(reordered, route)
+		}
 	}
 	if reordered[0].Channel != routes[0].Channel {
 		s.logger.Debug("会话亲和改选了渠道",
@@ -52,6 +68,30 @@ func (s *Server) affinityRoutes(
 			"configured", routeOf(routes[0]))
 	}
 	return reordered
+}
+
+// affinityPool 返回参与亲和的候选下标。
+//
+// 组名取第一条带组名的候选。同组候选组成一个池，组名不同的候选不混在一起。
+// 多条规则写不同组名时只认排在最前的那一组，其余按池外候选处理。
+func affinityPool(routes []config.Route) []int {
+	group := ""
+	for _, route := range routes {
+		if route.Affinity != "" {
+			group = route.Affinity
+			break
+		}
+	}
+	if group == "" {
+		return nil
+	}
+	var pool []int
+	for index, route := range routes {
+		if route.Affinity == group {
+			pool = append(pool, index)
+		}
+	}
+	return pool
 }
 
 // sessionKey 返回本次请求的会话标识，没有时返回空串。
@@ -63,16 +103,6 @@ func sessionKey(request *http.Request, client dialect.Name, body []byte) string 
 		return value
 	}
 	return strings.TrimSpace(dialect.SessionKeyOf(client, body))
-}
-
-// anyAffinity 报告候选路由里是否有规则要求做亲和。
-func anyAffinity(routes []config.Route) bool {
-	for _, route := range routes {
-		if route.Affinity {
-			return true
-		}
-	}
-	return false
 }
 
 // routeIdentity 是一条候选在亲和分配里的身份。

@@ -30,13 +30,14 @@ channels:
 models:
   - match: "gpt-*"
     channel: openrouter
-  # 同一个模型的两条规则互为候选。affinity 打开后，带上会话标识的请求会粘在
-  # 其中一家的账号上，让上游的提示缓存有机会命中。
+  # 组名相同的规则组成一个池。带上会话标识的请求会在池内粘住一条渠道，让上游的
+  # 提示缓存有机会命中。两条都写同一个组名，它们才构成可互换的候选。
   - match: "claude-*"
     channel: openrouter
-    affinity: true
+    affinity: accounts
   - match: "claude-*"
     channel: backup
+    affinity: accounts
 
 plugins:
   dir: plugins
