@@ -23,6 +23,13 @@ const (
 	DefaultMaxBodyBytes = 32 << 20
 	// MaxRetries 是渠道重试次数的上限，与 channel.MaxRetries 保持一致。
 	MaxRetries = 10
+	// 渠道亲和的参数默认值。
+	DefaultAffinityTableSize = 8192
+	DefaultAffinityTTL       = 10 * time.Minute
+	// DefaultAffinityMinPrefixBytes 是前缀的字节下限。按中英文混排估算，4096 字节
+	// 大致是一千出头到两千 tokens，落在上游最小可缓存长度（按模型 512 到 4096
+	// tokens）的下半段。它是个启发式，估不准时应当按实际模型调高。
+	DefaultAffinityMinPrefixBytes = 4096
 )
 
 // authStyleNone 表示不鉴权。单列成常量是因为它在校验里有独立分支。
@@ -44,6 +51,22 @@ type Config struct {
 	Channels []Channel `yaml:"channels"`
 	Models   []Model   `yaml:"models"`
 	Plugins  Plugins   `yaml:"plugins"`
+	Affinity Affinity  `yaml:"affinity"`
+}
+
+// Affinity 是渠道亲和的参数。哪些渠道参与亲和由 Model.Affinity 的组名决定，
+// 这里只放参数。
+//
+// 三个字段都是可选的，不写就用本文件里的默认常量。用指针是为了把「没写」与
+// 「显式写成 0」区分开：最小前缀长度写成 0 表示不做这个判断。
+type Affinity struct {
+	// TableSize 是前缀链记忆的条数上限。不大于零时没有会话标识的客户端不参与
+	// 亲和。
+	TableSize *int `yaml:"table_size"`
+	// TTL 是前缀链记忆的寿命，按上游缓存的寿命设。
+	TTL Duration `yaml:"ttl"`
+	// MinPrefixBytes 是前缀的字节下限，短于它时不做亲和。
+	MinPrefixBytes *int `yaml:"min_prefix_bytes"`
 }
 
 // Log 是日志配置。
@@ -272,11 +295,28 @@ func (c *Config) Validate() error {
 		keys[item.Key] = true
 	}
 
+	problems = append(problems, checkAffinity(c.Affinity)...)
+
 	if len(problems) == 0 {
 		return nil
 	}
 	sort.Strings(problems)
 	return fmt.Errorf("config: 配置有 %d 处问题:\n  - %s", len(problems), strings.Join(problems, "\n  - "))
+}
+
+// checkAffinity 校验亲和参数。取值都是可选的，给了就得合理。
+func checkAffinity(affinity Affinity) []string {
+	var problems []string
+	if affinity.TableSize != nil && *affinity.TableSize < 0 {
+		problems = append(problems, "affinity.table_size 不能为负")
+	}
+	if affinity.TTL < 0 {
+		problems = append(problems, "affinity.ttl 不能为负")
+	}
+	if affinity.MinPrefixBytes != nil && *affinity.MinPrefixBytes < 0 {
+		problems = append(problems, "affinity.min_prefix_bytes 不能为负")
+	}
+	return problems
 }
 
 // checkAuth 校验鉴权配置。凭据值只能来自环境变量，因此这里不接受字面量密钥。
@@ -318,4 +358,28 @@ func checkEnum(field, value string, allowed []string) []string {
 		return nil
 	}
 	return []string{fmt.Sprintf("%s: %q 不在允许取值 %s 内", field, value, strings.Join(allowed, "、"))}
+}
+
+// AffinityTableSize 返回前缀链记忆的条数上限。
+func (c *Config) AffinityTableSize() int {
+	if c.Affinity.TableSize == nil {
+		return DefaultAffinityTableSize
+	}
+	return *c.Affinity.TableSize
+}
+
+// AffinityTTL 返回前缀链记忆的寿命。
+func (c *Config) AffinityTTL() time.Duration {
+	if c.Affinity.TTL <= 0 {
+		return DefaultAffinityTTL
+	}
+	return c.Affinity.TTL.Duration()
+}
+
+// AffinityMinPrefixBytes 返回前缀的字节下限。返回零表示不做这个判断。
+func (c *Config) AffinityMinPrefixBytes() int {
+	if c.Affinity.MinPrefixBytes == nil {
+		return DefaultAffinityMinPrefixBytes
+	}
+	return *c.Affinity.MinPrefixBytes
 }

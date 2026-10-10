@@ -55,11 +55,16 @@ func (s *Server) forward(writer http.ResponseWriter, request *http.Request, clie
 			fmt.Sprintf("没有匹配模型 %s 的路由", model))
 		return
 	}
-	routes = s.affinityRoutes(request, client, body, routes)
+	plan := s.planAffinity(request, client, body, routes)
 
-	response, prepared, route := s.callUpstream(ctx, writer, client, model, stream, body, routes)
+	response, prepared, route := s.callUpstream(ctx, writer, client, model, stream, body, plan.routes)
 	if response == nil {
 		return
+	}
+	if len(plan.chain) > 0 {
+		// 记下真实服务的那条渠道，而不是选定的那条：降级换过渠道之后，下一轮
+		// 应当沿用的是缓存实际写在哪。
+		s.affinityTable.Remember(plan.chain, route.Channel)
 	}
 	defer func() { _ = response.Body.Close() }()
 	s.writeUpstream(writer, request, client, model, route, prepared, response)

@@ -39,6 +39,14 @@ models:
     channel: backup
     affinity: accounts
 
+# 亲和的参数。三个都可选，不写就用默认值。
+affinity:
+  # 前缀存在进程内的条数与寿命。寿命贴着上游缓存的寿命设。
+  table_size: 8192
+  ttl: 10m
+  # 共享前缀短于这个字节数时不做亲和，因为那种长度进不了上游缓存。
+  min_prefix_bytes: 4096
+
 plugins:
   dir: plugins
   list:
