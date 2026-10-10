@@ -14,6 +14,7 @@ channel/            上游渠道客户端与 SSE 读写
 plugin/             插件宿主
 config/             配置模型、加载与校验
 server/             HTTP 服务与装配
+internal/affinity/  会话与渠道的亲和支持
 internal/archtest/  结构守卫测试，不被任何包导入
 plugin-api/v1/      插件接口定义
 docs/               转换、插件、配置三份规范
@@ -79,6 +80,7 @@ make tools      # 按 .mise.toml 装齐工具链
 - `plugin/examples_test.go` 与 `config/config_test.go` 会跑 `examples/` 下的配置与插件，
   改了示例必须让测试继续通过。
 - `server` 的测试用进程内假上游，不依赖真实网络。
+- 渠道亲和的分配用 rendezvous 哈希，测试断言「渠道下线只移动它自己的份额」这条性质。
 - `internal/archtest` 守着公开面，新增导出声明后跑一次即可确认没有引入上游类型。
 
 ## 文档

@@ -55,6 +55,7 @@ func (s *Server) forward(writer http.ResponseWriter, request *http.Request, clie
 			fmt.Sprintf("没有匹配模型 %s 的路由", model))
 		return
 	}
+	routes = s.affinityRoutes(request, client, body, routes)
 
 	response, prepared, route := s.callUpstream(ctx, writer, client, model, stream, body, routes)
 	if response == nil {
