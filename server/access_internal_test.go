@@ -50,7 +50,7 @@ func TestAccessWriterRecordsImplicitStatus(t *testing.T) {
 // 请求卡住或进程被杀时完成行不再出现，至少还留下这一行。
 //
 // 日志缓冲不需要加锁：三次读取都排在 channel 之后，handler goroutine 里对应的写入与
-// 读取之间因此有 happens-before 关系，去掉进入行的改动仍能通过 -race。以后若在未经
+// 读取之间因此有 happens-before 关系，把锁去掉之后 -race 仍然通过。以后若在未经
 // channel 的位置读它，-race 会把新出现的竞争报出来。
 func TestAccessMiddlewareLogsArrivalBeforeHandlerReturns(t *testing.T) {
 	logs := &bytes.Buffer{}
