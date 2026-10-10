@@ -23,7 +23,7 @@ type outcomeCollector struct {
 	outcomes []server.Outcome
 }
 
-func (c *outcomeCollector) add(outcome server.Outcome) {
+func (c *outcomeCollector) add(_ context.Context, outcome server.Outcome) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.outcomes = append(c.outcomes, outcome)

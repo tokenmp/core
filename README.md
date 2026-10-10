@@ -65,10 +65,11 @@ func main() {
 服务给每个进入的请求记两行访问日志（进入与完成），用传进来的 logger 写出，
 级别按配置的 `log.level` 定。字段与级别口径见[配置规范](docs/config.md)的「访问日志」一节。
 
-宿主想在每次请求结束时记自己的指标，用 `WithRequestDone` 拿原始量：
+宿主想在每次请求结束时记自己的指标，用 `WithRequestDone` 拿原始量，
+回调带本次请求一直沿用下来的 context 与 `Outcome`：
 
 ```go
-service, err := server.FromConfigWith(cfg, logger, server.WithRequestDone(func(outcome server.Outcome) {
+service, err := server.FromConfigWith(cfg, logger, server.WithRequestDone(func(ctx context.Context, outcome server.Outcome) {
     // 口径由宿主定，core 只交原始量。
     logger.Info("请求结束",
         "ttft", outcome.FirstByte,
@@ -87,37 +88,46 @@ service, err := server.FromConfigWith(cfg, logger, server.WithRequestDone(func(o
 - `Usage` 只在跨方言转发且上游给出用量时非空。同方言透传按字节转发、不解析，
   流式响应的 TPS 因此算不出来。
 - 回调同步跑在请求的 goroutine 上，宿主在里面做的耗时工作会算进客户端等待时间里。
+  回调返回之后，net/http 会取消这个请求的 context，别在回调里开依赖它的 goroutine。
   它 panic 会被吞掉并记一行 ERROR，不连累别的请求。
 
-宿主想自己接管记录，用 `WithMiddleware` 包住内核的处理器：
+宿主想自己接管记录，把 `WithMiddleware` 与 `WithRequestDone` 两个口子都用上：
 
 ```go
 service, err := server.FromConfigWith(cfg, logger, server.WithoutAccessLog(),
     server.WithMiddleware(func(next http.Handler) http.Handler {
         return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-            next.ServeHTTP(w, r)
-            // 内核的内部数据在这里已经填好，不必去解析日志。
-            if outcome, ok := server.OutcomeFromContext(r.Context()); ok {
-                logger.Info("请求结束",
-                    "request_id", outcome.RequestID,
-                    "channel", outcome.Channel,
-                    "ttft", outcome.FirstByte,
-                    "attempts", len(outcome.Attempts))
-            }
+            // 中间件装在外侧：它加进 context 的值会一路传下去。
+            ctx := context.WithValue(r.Context(), myStateKey{}, startTiming(r))
+            next.ServeHTTP(w, r.WithContext(ctx))
         })
+    }),
+    server.WithRequestDone(func(ctx context.Context, outcome server.Outcome) {
+        // 回调是这个缺口的唯一数据入口，带 ctx 与这次请求的原始量。
+        logger.Info("请求结束",
+            "request_id", outcome.RequestID,
+            "channel", outcome.Channel,
+            "ttft", outcome.FirstByte,
+            "attempts", len(outcome.Attempts))
     }))
 ```
 
-中间件装在内核访问日志的**内侧**，它拿到的 context 里已经有本次请求的访问记录，
-所以 `OutcomeFromContext` 在 `next` 返回之后能读到渠道、每次尝试、用量与首字节时间。
+`OnRequestDone` 是宿主拿到内核内部数据的唯一入口，每次请求结束时同步调用，
+参数是本次请求一直沿用下来的 context 与 `Outcome`（渠道、每次尝试、用量、
+首字节时间、写出字节数）。中间件装在整个服务（含访问日志）的外侧，负责 HTTP
+层的控制：加响应头、换请求体、自己裹 `ResponseWriter`、往 context 里放请求级的
+记账状态。
+
 `WithoutAccessLog()` 关掉内核自己那两行，避免与宿主的记录重复；关掉之后进入行里的
 `client` 与 `user_agent` 也一起没有，需要的话从 `Outcome` 的同名字段自己记。
 
-两个边界要知道：
+几个边界要知道：
 
 - 包装 `http.ResponseWriter` 时必须把 `Flush` 转发下去，
-  否则流式响应会静默退化成不刷新。
-- `OutcomeFromContext` 只能在本次请求的 goroutine 上调用：它读的那条记录不加锁。
+  否则流式响应会静默退化成不刷新。内核只统计经传给 next 的 writer 写出的字节，
+  宿主在 pre/post 里直接在原 writer 上写、或先设了状态码，不进入 `Outcome`。
+- 中间件不调用 `next` 时内核整个不参与：没有访问日志、没有回调，
+  那条请求由宿主自己记账。
 - 改请求头不会传到上游 —— 上游请求头来自渠道配置，内核不从进来的请求里抄。
   请求体可以换：内核从 `request.Body` 读，换过之后参与路由的就是新内容。
 

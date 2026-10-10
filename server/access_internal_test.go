@@ -136,7 +136,7 @@ func TestOutcomeForHandlerThatWritesNothing(t *testing.T) {
 	service := &Server{
 		logger: slog.New(slog.DiscardHandler),
 		now:    time.Now,
-		onRequestDone: func(outcome Outcome) {
+		onRequestDone: func(_ context.Context, outcome Outcome) {
 			called = true
 			got = outcome
 		},
@@ -163,7 +163,7 @@ func TestOutcomeCallbackPanicIsContained(t *testing.T) {
 	service := &Server{
 		logger:        slog.New(slog.NewJSONHandler(logs, nil)),
 		now:           time.Now,
-		onRequestDone: func(Outcome) { panic("宿主回调故意失败") },
+		onRequestDone: func(context.Context, Outcome) { panic("宿主回调故意失败") },
 	}
 	handler := service.withAccessLog(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.WriteHeader(http.StatusOK)
@@ -183,7 +183,7 @@ func TestOutcomeCallbackPanicKeepsHandlerPanic(t *testing.T) {
 	service := &Server{
 		logger:        slog.New(slog.DiscardHandler),
 		now:           time.Now,
-		onRequestDone: func(Outcome) { panic("宿主回调的失败") },
+		onRequestDone: func(context.Context, Outcome) { panic("宿主回调的失败") },
 	}
 	handler := service.withAccessLog(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		panic("处理器的失败")
@@ -196,47 +196,6 @@ func TestOutcomeCallbackPanicKeepsHandlerPanic(t *testing.T) {
 	}()
 	handler.ServeHTTP(httptest.NewRecorder(),
 		httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/boom", nil))
-}
-
-// TestOutcomeFromContextDuringHandlerPanic 覆盖文档写明的另一处边界：处理器 panic 时，
-// 宿主的 defer 跑在内核收尾之前（最内层的 defer 先跑），因此快照里的状态码还是按「没写出
-// 响应头就是 200」记，而完成行按 500 记，两者会不一致。这正是文档要求在 next 返回之后读的原因。
-func TestOutcomeFromContextDuringHandlerPanic(t *testing.T) {
-	logs := &bytes.Buffer{}
-	var (
-		snapshot Outcome
-		usable   bool
-	)
-	service := &Server{
-		logger: slog.New(slog.NewJSONHandler(logs, nil)),
-		now:    time.Now,
-		middleware: func(http.Handler) http.Handler {
-			return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				// defer 隳在这里：它跑在内核收尾之前，看到的是还没定下的状态码。
-				readOutcome := func(ctx context.Context) {
-					snapshot, usable = OutcomeFromContext(ctx)
-				}
-				defer readOutcome(request.Context())
-				panic("中间件自己抛的")
-			})
-		},
-	}
-	handler := service.routes()
-	func() {
-		defer func() { _ = recover() }()
-		handler.ServeHTTP(httptest.NewRecorder(),
-			httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/boom", nil))
-	}()
-
-	if !usable {
-		t.Fatal("请求范围内应当取得到")
-	}
-	if snapshot.Status != http.StatusOK {
-		t.Fatalf("快照里的状态码按「没写出响应头就是 200」记: %d", snapshot.Status)
-	}
-	if text := logs.String(); !strings.Contains(text, `"status":500`) {
-		t.Fatalf("完成行应当按 500 记: %s", text)
-	}
 }
 
 // TestAccessMiddlewareLogsPanic 覆盖处理器 panic：这条请求确实失败了，不能按
