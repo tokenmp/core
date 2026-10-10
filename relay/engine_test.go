@@ -3,7 +3,6 @@ package relay_test
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"testing"
 
 	"github.com/tokenmp/core/dialect"
@@ -104,8 +103,12 @@ func TestPrepareRequestConvertsEveryPair(t *testing.T) {
 			if err := dialect.CheckPayload(to, decoded); err != nil {
 				t.Fatalf("转换结果类型不符: %v", err)
 			}
-			if prepared.Result == nil || prepared.Result.To != to.RelayFormat() {
-				t.Fatalf("转换结果目标方言不符: %+v", prepared.Result)
+			report := prepared.Report()
+			if report.To != to || report.From != from {
+				t.Fatalf("转换报告方言不符: %+v", report)
+			}
+			if report.Converter == "" {
+				t.Fatalf("转换报告应当带转换器标识: %+v", report)
 			}
 		})
 	}
@@ -286,13 +289,17 @@ func TestPreparedDiagnosticsCarrySteps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("转换失败: %v", err)
 	}
-	if len(prepared.Result.Steps) == 0 {
-		t.Fatal("转换结果应当带路径")
+	report := prepared.Report()
+	if len(report.Steps) == 0 {
+		t.Fatal("转换报告应当带路径")
 	}
-	if prepared.Result.Quality == "" {
-		t.Fatal("转换结果应当带质量等级")
+	if report.Quality == "" {
+		t.Fatal("转换报告应当带质量等级")
 	}
-	if !strings.Contains(string(prepared.Result.From), "claude") {
-		t.Fatalf("来源方言不符: %s", prepared.Result.From)
+	if report.From != dialect.ClaudeMessages {
+		t.Fatalf("来源方言不符: %s", report.From)
+	}
+	if report.Steps[0].From != dialect.ClaudeMessages {
+		t.Fatalf("第一跳的来源方言不符: %+v", report.Steps[0])
 	}
 }

@@ -150,15 +150,29 @@ relayconvert.SetMediaResolver(relayconvert.MediaResolver{
 ## 与 RelayKit 的关系
 
 协议转换由 `github.com/QuantumNous/new-api/relaykit` 承担，本项目没有重写它。
-转换结果的诊断与用量直接使用它的类型：`types.ConversionDiagnostic` 与
-`dto.Usage`。这是刻意的取舍：包装一层只会让调用方多绕一次，而信息量不变。
+RelayKit 的 DTO 与 `dto.Usage` 因此是本模块公开契约的一部分，而不是纯粹的实现
+细节。这一点是刻意承认的，不是疏忽。
+
+公开面里哪些东西属于 RelayKit，哪些属于本模块，按下面这条线分：
+
+| 类别 | 归属 | 理由 |
+| --- | --- | --- |
+| 诊断、质量等级、转换步骤、损耗策略、推理设置 | 本模块 | 字段少且含义稳定，CLI 要照自己的格式打印 |
+| 四种方言的请求与响应 DTO | RelayKit | 重新建模等于重写协议转换 |
+| 归一后的用量 `dto.Usage` | RelayKit | 19 个字段且仍在增长，镜像它必然漂移 |
+
+第二条与第三条意味着调用方取值时要用 RelayKit 的类型做断言或读取字段。
+代理四家厂商的协议本来就绕不开它们的字段形状，本模块选择不假装绕得开。
 
 代价是 RelayKit 处于 v0.x，它的小版本调整会传导到本模块的公开面。
 `go.mod` 精确锁定版本，升级由单独的 PR 完成，见 [AGENTS.md](../AGENTS.md) 的
 「升级上游」一节。
 
-需要图片或 data URL 解析时按上面的方式注册回调。
-本项目不转发 `relayconvert` 的全部入口，只暴露 `relay.Engine`。
+`internal/archtest` 会检查导出声明，确认新增的公开面没有误带上游类型。
+例外清单只有两处用量字段。
+
+需要图片或 data URL 解析时用 `relay.SetMediaResolver` 注册回调，
+不要直接依赖 `relayconvert`。本项目只暴露 `relay.Engine` 一个转换入口。
 
 ## 上游路径
 

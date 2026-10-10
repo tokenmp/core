@@ -68,8 +68,15 @@ golangci-lint fmt --diff 格式检查
 本仓库是库，按语义化版本打 tag，形如 `v0.1.0`。
 `go.mod` 的模块路径不带主版本后缀。
 
-发布前确认三件事：`make check` 全绿，CHANGELOG 无遗留条目，
-公开面的变更已经写进 release notes。
+打 tag 之前逐条确认：
+
+- `make check` 在 `main` 上全绿。
+- 公开面的改动已经写进 tag 的说明，包括新增、改名与删除的导出标识符。
+- 上游依赖的版本已经在 `go.mod` 里锁定，`go.sum` 与之同步。
+- 新依赖的许可已经加进 [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md)。
+
+`go.mod` 里 `go` 指令声明的版本由 CI 的 `min-go` job 实际验证，
+改动它必须让那个 job 继续通过。
 
 ## 许可
 
