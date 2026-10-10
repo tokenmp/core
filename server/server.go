@@ -19,6 +19,7 @@ import (
 	"github.com/tokenmp/core/channel"
 	"github.com/tokenmp/core/config"
 	"github.com/tokenmp/core/dialect"
+	"github.com/tokenmp/core/internal/affinity"
 	"github.com/tokenmp/core/plugin"
 	"github.com/tokenmp/core/relay"
 )
@@ -59,6 +60,10 @@ type Server struct {
 	now          func() time.Time
 	maxBodyBytes int64
 	handler      http.Handler
+	// affinityTable 记住「请求前缀 → 渠道」，供没有会话标识的客户端兜底。
+	affinityTable *affinity.Table
+	// minPrefixBytes 是前缀的字节下限，短于它时不做亲和。零表示不判断。
+	minPrefixBytes int
 }
 
 // New 创建服务。
@@ -97,6 +102,12 @@ func New(opts Options) (*Server, error) {
 		logger:       logger,
 		now:          now,
 		maxBodyBytes: maxBodyBytes,
+		affinityTable: affinity.NewTable(
+			opts.Config.AffinityTableSize(),
+			opts.Config.AffinityTTL(),
+			now,
+		),
+		minPrefixBytes: opts.Config.AffinityMinPrefixBytes(),
 	}
 	server.handler = server.routes()
 	return server, nil

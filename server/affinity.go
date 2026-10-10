@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/tokenmp/core/config"
@@ -20,34 +21,108 @@ const SessionHeaderName = "X-TokenMP-Session"
 // minPoolSize 是亲和池起作用所需的最少成员数。只有一条候选时没有可分配的对象。
 const minPoolSize = 2
 
-// affinityRoutes 按会话标识重排候选路由。
+// affinityPlan 是一次请求的亲和安排。
+type affinityPlan struct {
+	// routes 是按亲和重排后的候选。池不成立时就是传进来的那些。
+	routes []config.Route
+	// chain 非空表示这次靠前缀链分配，选到渠道之后要把结果记下来。
+	chain []uint64
+}
+
+// planAffinity 算出候选路由的尝试顺序。
 //
-// 池内按 rendezvous 哈希定序，粘住的那条排到最前；池外的候选保持配置顺序，
-// 排在池后面。只重排，不筛选：粘住的渠道失败时，后面的候选照旧按这个顺序兜底。
-// 因此亲和是偏好而不是钉子，渠道不可用时不会把请求卡在那里。
-func (s *Server) affinityRoutes(
+// 池内按会话标识定序，粘住的那条排到最前；池外的候选保持配置顺序，排在池后面。
+// 只重排，不筛选：粘住的渠道失败时，后面的候选照旧按这个顺序兜底。因此亲和是偏好
+// 而不是钉子，渠道不可用时不会把请求卡在那里。
+func (s *Server) planAffinity(
 	request *http.Request,
 	client dialect.Name,
 	body []byte,
 	routes []config.Route,
-) []config.Route {
+) affinityPlan {
 	pool := affinityPool(routes)
 	if len(pool) < minPoolSize {
-		// 池里只有一个成员时亲和没有可分配的对象，保持配置顺序。
-		// 这也让「只给一条规则写了组名」回到什么都不做的保守行为。
-		return routes
+		// 池里只有一个成员时亲和没有可分配的对象，保持配置顺序。这也让「只给一条
+		// 规则写了组名」回到什么都不做的保守行为。
+		return affinityPlan{routes: routes}
 	}
-	key := sessionKey(request, client, body)
-	if key == "" {
-		// 客户端没有给出会话标识。此时任何分配都只能靠请求内容猜，而这个模块
-		// 不做猜测，保持配置顺序。
-		return routes
+
+	// 显式标识优先。它与方言无关，Claude 与 Gemini 的客户端只能靠它。
+	if key := explicitSessionKey(request, client, body); key != "" {
+		return affinityPlan{routes: s.orderByHash(key, pool, routes)}
 	}
+
+	// 没有标识时靠请求内容认出上一轮发过的前缀。
+	entries, err := dialect.EntriesOf(client, body)
+	if err != nil {
+		// 切分失败不影响转发，只是这次做不了亲和。
+		return affinityPlan{routes: routes}
+	}
+	if minimum := s.minPrefixBytes; minimum > 0 && affinity.PrefixBytes(entries) < minimum {
+		// 前缀短到进不了上游缓存，钉住只剩负载集中的坏处。
+		return affinityPlan{routes: routes}
+	}
+	chain := affinity.Chain(entries)
+	if len(chain) == 0 {
+		return affinityPlan{routes: routes}
+	}
+	if channel, ok := s.affinityTable.Recall(chain); ok {
+		return affinityPlan{routes: orderByChannel(channel, pool, routes), chain: chain}
+	}
+	// 冷启动：按这一轮的内容先定一条，下一轮靠这条链查回来。
+	return affinityPlan{
+		routes: s.orderByHash(strconv.FormatUint(chain[len(chain)-1], 16), pool, routes),
+		chain:  chain,
+	}
+}
+
+// explicitSessionKey 返回客户端显式给出的会话标识，没有时返回空串。
+//
+// 请求头优先：它与方言无关，Claude 与 Gemini 的客户端只能靠它。
+// prompt_cache_key 是 OpenAI 为缓存路由专门提供的字段，作为兜底。
+func explicitSessionKey(request *http.Request, client dialect.Name, body []byte) string {
+	if value := strings.TrimSpace(request.Header.Get(SessionHeaderName)); value != "" {
+		return value
+	}
+	return strings.TrimSpace(dialect.SessionKeyOf(client, body))
+}
+
+// orderByHash 按 rendezvous 哈希给池内候选定序，池外的候选跟在后面。
+func (s *Server) orderByHash(key string, pool []int, routes []config.Route) []config.Route {
 	identities := make([]string, len(pool))
 	for position, index := range pool {
 		identities[position] = routeIdentity(routes[index])
 	}
 	order := affinity.Order(key, identities)
+	reordered := orderPool(order, pool, routes)
+	s.logAffinityChange(key, reordered, routes)
+	return reordered
+}
+
+// orderByChannel 把某个渠道的候选排到最前，池内其余候选保持配置顺序。
+//
+// 不走哈希，因为要指定的就是那一条。后面的顺序跟配置一致，读起来最直观。
+func orderByChannel(channel string, pool []int, routes []config.Route) []config.Route {
+	order := make([]int, 0, len(pool))
+	for position, index := range pool {
+		if routes[index].Channel == channel {
+			order = append(order, position)
+		}
+	}
+	if len(order) == 0 {
+		// 记住的渠道已经不在候选里了，回到配置顺序。
+		return routes
+	}
+	for position, index := range pool {
+		if routes[index].Channel != channel {
+			order = append(order, position)
+		}
+	}
+	return orderPool(order, pool, routes)
+}
+
+// orderPool 按给定的池内顺序组装候选列表。
+func orderPool(order []int, pool []int, routes []config.Route) []config.Route {
 	reordered := make([]config.Route, 0, len(routes))
 	for _, position := range order {
 		reordered = append(reordered, routes[pool[position]])
@@ -61,13 +136,21 @@ func (s *Server) affinityRoutes(
 			reordered = append(reordered, route)
 		}
 	}
-	if reordered[0].Channel != routes[0].Channel {
-		s.logger.Debug("会话亲和改选了渠道",
-			"session", maskSession(key),
-			"sticky", routeOf(reordered[0]),
-			"configured", routeOf(routes[0]))
-	}
 	return reordered
+}
+
+// logAffinityChange 在亲和改变了首选渠道时记一条调试日志。
+func (s *Server) logAffinityChange(key string, reordered, original []config.Route) {
+	if len(reordered) == 0 || len(original) == 0 {
+		return
+	}
+	if reordered[0].Channel == original[0].Channel {
+		return
+	}
+	s.logger.Debug("会话亲和改选了渠道",
+		"session", maskSession(key),
+		"sticky", routeOf(reordered[0]),
+		"configured", routeOf(original[0]))
 }
 
 // affinityPool 返回参与亲和的候选下标。
@@ -92,17 +175,6 @@ func affinityPool(routes []config.Route) []int {
 		}
 	}
 	return pool
-}
-
-// sessionKey 返回本次请求的会话标识，没有时返回空串。
-//
-// 请求头优先：它与方言无关，Claude 与 Gemini 的客户端只能靠它。
-// prompt_cache_key 是 OpenAI 为缓存路由专门提供的字段，作为兜底。
-func sessionKey(request *http.Request, client dialect.Name, body []byte) string {
-	if value := strings.TrimSpace(request.Header.Get(SessionHeaderName)); value != "" {
-		return value
-	}
-	return strings.TrimSpace(dialect.SessionKeyOf(client, body))
 }
 
 // routeIdentity 是一条候选在亲和分配里的身份。
