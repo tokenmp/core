@@ -25,8 +25,9 @@ type upstreamHeaderKey struct{}
 // 这个入口的用途。覆盖是显式的，渠道配置自己不受影响，宿主没设的同名头照旧上去。
 // 渠道的鉴权头是例外，它在最后按 Auth 写入，宿主设的同名头不生效，凭据始终由渠道决定。
 //
-// 名字为空、或名字与取值含换行时，这条头在转发时被丢弃并记一行 WARN：让一个写错的
-// 头名把整条请求带成 502 代价太大。
+// 名字不是合法的 HTTP 头名（RFC 7230 的 token），或取值含控制字符时，这条头在转发
+// 时被丢弃并记一行 WARN：让一个写错的头名把整条请求带成 502 代价太大。水平制表符
+// 在取值里是合法的，其他控制字符不是。
 func WithUpstreamHeader(ctx context.Context, name, value string) context.Context {
 	headers := maps.Clone(upstreamHeadersOf(ctx))
 	if headers == nil {
@@ -52,7 +53,7 @@ func (s *Server) upstreamHeaders(ctx context.Context) http.Header {
 	}
 	out := make(http.Header, len(headers))
 	for name, value := range headers {
-		if name == "" || strings.ContainsAny(name, "\r\n") || strings.ContainsAny(value, "\r\n") {
+		if !validHeaderName(name) || !validHeaderValue(value) {
 			// 这里只记头名不记取值：取值是宿主可控的字符串，日志里少放一份。
 			s.logger.Warn("丢弃非法的上游请求头", "request_id", requestIDOf(ctx), "header", name)
 			continue
@@ -63,4 +64,40 @@ func (s *Server) upstreamHeaders(ctx context.Context) http.Header {
 		return nil
 	}
 	return out
+}
+
+// validHeaderName 判断名字是不是合法的 HTTP 头名，即 RFC 7230 的 token。
+//
+// 只挡空名与换行不够：名字里带空格这类字符时 Go 的传输层会在写请求时报错，那条请求
+// 就变成 502 了，与「写错一个头名不该带走整条请求」相反。标准库没有导出这个判断，
+// 为它拉一个依赖不划算，所以按 token 字符集自己判。
+func validHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for index := 0; index < len(name); index++ {
+		switch character := name[index]; {
+		case character >= 'a' && character <= 'z', character >= 'A' && character <= 'Z',
+			character >= '0' && character <= '9':
+		case strings.IndexByte("!#$%&'*+-.^_`|~", character) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validHeaderValue 判断取值里有没有会被传输层拒掉的控制字符（水平制表符除外），
+// 理由与头名相同。
+func validHeaderValue(value string) bool {
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if character == '\t' {
+			continue
+		}
+		if character < 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	return true
 }

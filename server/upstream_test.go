@@ -200,3 +200,35 @@ models:
 		t.Fatalf("鉴权头应当由渠道凭据决定: Authorization=%q", value)
 	}
 }
+
+// TestUpstreamHeaderInvalidNameDropped 覆盖名字与取值的字符边界：名字里带空格这类
+// 非法 token（以及取值里的控制字符）会让 Go 的传输层直接报错拒绝写请求，那条请求
+// 就变成 502 了。这里要求它们与含换行的情形一样被丢掉、只记一行 WARN，转发照常完成。
+func TestUpstreamHeaderInvalidNameDropped(t *testing.T) {
+	record, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, openAIChatResponse)
+	})
+	front, logs, _ := newSeamServer(t, seamYAML(upstreamServer.URL), server.WithMiddleware(
+		withUpstreamHeaders([][2]string{
+			{"X-Ok", "fine"},
+			{"X-Bad Name", "v"},
+			{"X-Ctrl", "a\x00b"},
+		})))
+
+	status, body := postWithHeaders(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`, nil)
+	if status != http.StatusOK {
+		t.Fatalf("写错一个头名不该把整条请求带成 502: %d %s", status, body)
+	}
+
+	got := record.last(t).Header
+	if value := got.Get("X-Ok"); value != "fine" {
+		t.Fatalf("合法的头不该受影响: X-Ok=%q", value)
+	}
+	if value := got.Get("X-Bad Name"); value != "" {
+		t.Fatalf("非法的头名不该上去: %q", value)
+	}
+	if !strings.Contains(logs.String(), "丢弃非法的上游请求头") {
+		t.Fatalf("丢弃非法头应当记一行 WARN: %s", logs.String())
+	}
+}
