@@ -240,6 +240,84 @@ models:
 	}
 }
 
+// upstreamModelResponse 返回某个渠道方言的最小可用响应，
+// 供上游模型名的端到端用例把状态码维持在 200。
+func upstreamModelResponse(name string) string {
+	switch name {
+	case "claude":
+		return `{"id":"msg_1","type":"message","role":"assistant","model":"x",` +
+			`"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn",` +
+			`"usage":{"input_tokens":1,"output_tokens":1}}`
+	case "gemini":
+		return `{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],` +
+			`"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`
+	default:
+		return `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"x",` +
+			`"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],` +
+			`"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
+	}
+}
+
+// TestUpstreamModelAppliesToEveryDirection 是 issue #8 的核心回归：客户端一律请求
+// model: m1，规则写 upstream: UPSTREAM-NAME，断言假上游收到的模型名与路径都对。
+func TestUpstreamModelAppliesToEveryDirection(t *testing.T) {
+	openAIBody := `{"model":"m1","messages":[{"role":"user","content":"hi"}]}`
+	claudeBody := `{"model":"m1","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+	cases := []struct {
+		name      string
+		path      string
+		body      string
+		channel   string
+		wantPath  string
+		wantModel string // 为空表示模型名在路径上，不检查报文
+	}{
+		{"OpenAI Chat 到 openai", "/v1/chat/completions", openAIBody, "openai",
+			"/v1/chat/completions", "UPSTREAM-NAME"},
+		{"OpenAI Chat 到 claude", "/v1/chat/completions", openAIBody, "claude",
+			"/v1/messages", "UPSTREAM-NAME"},
+		{"Claude Messages 到 openai", "/v1/messages", claudeBody, "openai",
+			"/v1/chat/completions", "UPSTREAM-NAME"},
+		{"OpenAI Chat 到 gemini", "/v1/chat/completions", openAIBody, "gemini",
+			"/v1beta/models/UPSTREAM-NAME:generateContent", ""},
+		{"Claude Messages 到 gemini", "/v1/messages", claudeBody, "gemini",
+			"/v1beta/models/UPSTREAM-NAME:generateContent", ""},
+	}
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			record, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+				writeJSON(writer, http.StatusOK, upstreamModelResponse(item.channel))
+			})
+			front := newServer(t, `
+channels:
+  - {name: upstream, dialect: `+item.channel+`, base_url: "`+upstreamServer.URL+`"}
+models:
+  - {match: "m1", channel: upstream, upstream: "UPSTREAM-NAME"}
+`, "")
+
+			status, _, body := post(t, front.URL+item.path, item.body)
+			if status != http.StatusOK {
+				t.Fatalf("状态码不符: %d %s", status, body)
+			}
+			got := record.last(t)
+			if got.Path != item.wantPath {
+				t.Fatalf("上游路径不符:\n期望 %s\n实际 %s", item.wantPath, got.Path)
+			}
+			if item.wantModel == "" {
+				return
+			}
+			var decoded struct {
+				Model string `json:"model"`
+			}
+			if err := json.Unmarshal(got.Body, &decoded); err != nil {
+				t.Fatalf("上游请求体不是合法 JSON: %v / %s", err, got.Body)
+			}
+			if decoded.Model != item.wantModel {
+				t.Fatalf("上游收到的模型名不符:\n期望 %s\n实际 %s", item.wantModel, decoded.Model)
+			}
+		})
+	}
+}
+
 func TestGeminiPathRouting(t *testing.T) {
 	record, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
 		writeJSON(writer, http.StatusOK, `{"candidates":[{"content":{"role":"model","parts":[{"text":"你好"}]}}]}`)

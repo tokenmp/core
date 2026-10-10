@@ -102,6 +102,10 @@ type Auth struct {
 // Model 是一条模型路由规则。Match 支持 * 通配，同一个模型可以有多条规则，
 // 按配置顺序依次尝试。
 //
+// Upstream 是发往上游的模型名，可以写 ${model} 占位符，替换成客户端请求里
+// 经插件改写后真正参与匹配的那个模型名。写法与校验规则见 Validate 与
+// docs/config.md。
+//
 // Affinity 是渠道亲和的组名。命中该模型的规则里，组名相同的候选组成一个池，
 // 池里的渠道被当作可互换的；同一段会话的连续请求会在池内粘住一条，池外的候选
 // 按配置顺序排在池后面兜底。留空表示不参与。
@@ -169,6 +173,10 @@ func (c *Config) Resolve(model string) []Route {
 		upstream := rule.Upstream
 		if upstream == "" {
 			upstream = model
+		} else {
+			// 占位符只认 ${model}，未知写法在 Validate 里已经拦下；
+			// 这里替换后其余字符原样保留。
+			upstream = strings.ReplaceAll(upstream, "${model}", model)
 		}
 		routes = append(routes, Route{
 			Channel:  channel.Name,
@@ -282,6 +290,7 @@ func (c *Config) Validate() error {
 				problems = append(problems, fmt.Sprintf("%s: dialect %q 不是支持的方言", where, rule.Dialect))
 			}
 		}
+		problems = append(problems, checkUpstream(where, rule.Upstream)...)
 	}
 
 	keys := make(map[string]bool, len(c.Plugins.List))
@@ -302,6 +311,33 @@ func (c *Config) Validate() error {
 	}
 	sort.Strings(problems)
 	return fmt.Errorf("config: 配置有 %d 处问题:\n  - %s", len(problems), strings.Join(problems, "\n  - "))
+}
+
+// checkUpstream 校验 upstream 里的占位符写法。
+//
+// $ 只在紧跟 { 时进入占位符形式，其余位置都是普通字符，因此 $$ 就是两个美元
+// 符号，单独的 } 也没有特殊含义。进入占位符后只认 ${model}：${ 开了头却没有
+// 配对的 } 报错，配对了但名字不是 model 也报错。两种错误都带上 models 下标。
+// 不做捕获占位符，理由见 docs/config.md 的「条款」一节。
+func checkUpstream(where, upstream string) []string {
+	var problems []string
+	for i := 0; i < len(upstream); i++ {
+		if upstream[i] != '$' || i+1 >= len(upstream) || upstream[i+1] != '{' {
+			continue
+		}
+		rest := upstream[i+2:]
+		end := strings.IndexByte(rest, '}')
+		if end < 0 {
+			problems = append(problems, fmt.Sprintf("%s: upstream %q 里的 ${ 没有配对的 }", where, upstream))
+			break
+		}
+		if name := rest[:end]; name != "model" {
+			problems = append(problems, fmt.Sprintf("%s: upstream %q 里的 ${%s} 不是支持的占位符，只支持 ${model}", where, upstream, name))
+		}
+		// 跳过 ${name}，避免同一段被重复扫描。
+		i += len("${") + end
+	}
+	return problems
 }
 
 // checkAffinity 校验亲和参数。取值都是可选的，给了就得合理。

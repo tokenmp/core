@@ -2,9 +2,9 @@
 // 转换回客户端方言，并在两个方向上原样带出转换损耗的诊断。
 //
 // 内核是纯函数式的，不发网络请求、不读配置：上游地址、鉴权、重试都在 channel
-// 与 server 层。同方言不走转换，由调用方按字节透传，因此本包在两方言相同时
-// 直接返回 passthrough 标记而不是重新序列化 —— 逐字节保留未建模字段只有在
-// 不经过 JSON 往返时才成立。
+// 与 server 层。同方言不走转换，本包在两方言相同时直接返回 passthrough 标记，
+// 只按字节定点改顶层 model 一个字段而不重新序列化 —— 逐字节保留未建模字段只有
+// 在不经过 JSON 往返时才成立。
 package relay
 
 import (
@@ -17,6 +17,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/reasoning"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/tidwall/sjson"
 
 	"github.com/tokenmp/core/dialect"
 )
@@ -93,7 +94,8 @@ func (e *Engine) ParseModel(model string) (string, *Reasoning) {
 
 // Prepared 是转换后的上游请求。
 type Prepared struct {
-	// Passthrough 为真时 Body 是客户端原始报文字节，未做解析。
+	// Passthrough 为真时 Body 是客户端原始报文字节（可能只改过顶层 model 一个
+	// 字段），未做 DTO 建模。
 	Passthrough bool
 	// Body 是发给上游的请求体。
 	Body []byte
@@ -141,24 +143,29 @@ type Request struct {
 
 // PrepareRequest 生成发给上游的请求体。
 //
-// 两方言相同时返回 Passthrough 为真的结果，不做任何解析。
+// 两方言相同时返回 Passthrough 为真的结果，不做 DTO 建模；但只要规则给了与
+// 客户端模型名不同的上游名，顶层 model 字段仍会被定点改写，见 setModelField。
 func (e *Engine) PrepareRequest(ctx context.Context, req Request) (*Prepared, error) {
+	upstreamModel := req.UpstreamModel
+	if upstreamModel == "" {
+		upstreamModel = req.OriginModel
+	}
 	if req.From == req.To {
 		stream, err := e.streamIntent(req)
 		if err != nil {
 			return nil, err
 		}
-		return &Prepared{Passthrough: true, Body: req.Body, Stream: stream}, nil
+		body, err := setModelField(req.To, req.Body, req.OriginModel, upstreamModel)
+		if err != nil {
+			return nil, err
+		}
+		return &Prepared{Passthrough: true, Body: body, Stream: stream}, nil
 	}
 	request, err := dialect.DecodeRequest(req.From, req.Body)
 	if err != nil {
 		return nil, err
 	}
 	stream := req.Stream || requestIsStream(request)
-	upstreamModel := req.UpstreamModel
-	if upstreamModel == "" {
-		upstreamModel = req.OriginModel
-	}
 	baseModel, parsed := e.ParseModel(req.OriginModel)
 	meta := &convmeta.Values{
 		OriginModelName:     baseModel,
@@ -176,12 +183,39 @@ func (e *Engine) PrepareRequest(ctx context.Context, req Request) (*Prepared, er
 	if err != nil {
 		return nil, err
 	}
+	body, err := setModelField(req.To, encoded, req.OriginModel, upstreamModel)
+	if err != nil {
+		return nil, err
+	}
 	return &Prepared{
-		Body:        encoded,
+		Body:        body,
 		Stream:      stream,
 		report:      reportOfRequest(result),
 		diagnostics: requestDiagnostics(result),
 	}, nil
+}
+
+// setModelField 把目标报文顶层的 model 字段定点改成上游模型名。
+//
+// 目标方言不是 Gemini、上游名又确实与客户端模型名不同时才改写，两个分支都走
+// 这里收口。这样做与 RelayKit 每个请求转换器各自的行为无关：四个方向的转换器
+// 对 UpstreamModelName 的处理并不一致，其中两个 Gemini 方向把模型名写进路径，
+// 而 claude_messages 转 openai 等方向仍沿用请求体里的模型名。既然四种方言的
+// 目标报文都在顶层有 model 字段，集中改一处比逐个方向补丁可靠。Gemini 的模型名
+// 在路径上而不是请求体里，由 channel 按 route.Upstream 拼路径，本来就对，跳过。
+//
+// 用 sjson 逐字节定点替换，不经过 DTO 往返：未建模字段、多余空白与 1e5 这类
+// 非规范写法全部原样保留。值相同时直接返回原字节，因此「规则没写 upstream」或
+// 「名字相同」的同方言请求仍然是零改动。
+func setModelField(to dialect.Name, body []byte, originModel, upstreamModel string) ([]byte, error) {
+	if to == dialect.GeminiGenerate || upstreamModel == "" || upstreamModel == originModel {
+		return body, nil
+	}
+	updated, err := sjson.SetBytes(body, "model", upstreamModel)
+	if err != nil {
+		return nil, fmt.Errorf("relay: 改写上游模型名失败: %w", err)
+	}
+	return updated, nil
 }
 
 // PreparedResponse 是转换后的非流式响应。

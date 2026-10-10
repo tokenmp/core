@@ -1,6 +1,7 @@
 package relay_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"testing"
@@ -206,6 +207,86 @@ func TestSameDialectIsPassthrough(t *testing.T) {
 		}
 		if _, err := engine.NewStream(name, name, "m", "m", relay.StreamOptions{}); err == nil {
 			t.Fatalf("%s: 同方言不应创建转换会话", name)
+		}
+	}
+}
+
+func TestSameDialectRewritesOnlyModelField(t *testing.T) {
+	engine := relay.NewEngine(relay.Options{})
+	// 非规范 JSON：多余空白、未建模字段与 1e5 写法都要原样保留，
+	// 只有 model 的值被定点替换。
+	body := `{"model":"m1",  "messages":[{"role":"user","content":"hi"}], "unknown_field":{"a":1}, "unknown_num":1e5}`
+	prepared, err := engine.PrepareRequest(context.Background(), relay.Request{
+		From:          dialect.OpenAIChat,
+		To:            dialect.OpenAIChat,
+		Body:          []byte(body),
+		OriginModel:   "m1",
+		UpstreamModel: "UPSTREAM/NAME",
+	})
+	if err != nil {
+		t.Fatalf("转换失败: %v", err)
+	}
+	if !prepared.Passthrough {
+		t.Fatal("同方言应当仍是透传")
+	}
+	want := `{"model":"UPSTREAM/NAME",  "messages":[{"role":"user","content":"hi"}], "unknown_field":{"a":1}, "unknown_num":1e5}`
+	if string(prepared.Body) != want {
+		t.Fatalf("只应改 model 一个字段:\n期望 %s\n实际 %s", want, prepared.Body)
+	}
+}
+
+func TestSameDialectKeepsBytesWhenModelUnchanged(t *testing.T) {
+	engine := relay.NewEngine(relay.Options{})
+	body := `{"model":"m1",  "messages":[], "unknown_num":1e5}`
+	// 未写 upstream 时上层传入空串，名字相同时传入同一个名字，两条路径都不能动字节。
+	for _, upstream := range []string{"", "m1"} {
+		prepared, err := engine.PrepareRequest(context.Background(), relay.Request{
+			From: dialect.OpenAIChat, To: dialect.OpenAIChat, Body: []byte(body),
+			OriginModel: "m1", UpstreamModel: upstream,
+		})
+		if err != nil {
+			t.Fatalf("转换失败: %v", err)
+		}
+		if string(prepared.Body) != body {
+			t.Fatalf("upstream=%q 时字节应完全不变，实际 %s", upstream, prepared.Body)
+		}
+	}
+}
+
+func TestGeminiTargetSkipsModelRewrite(t *testing.T) {
+	engine := relay.NewEngine(relay.Options{})
+	// Gemini 的模型名在路径上，由 channel 拼，报文里不该出现上游名。
+	prepared, err := engine.PrepareRequest(context.Background(), relay.Request{
+		From: dialect.OpenAIChat, To: dialect.GeminiGenerate,
+		Body:        []byte(requestSamples[dialect.OpenAIChat]),
+		OriginModel: "m1", UpstreamModel: "UPSTREAM-NAME",
+	})
+	if err != nil {
+		t.Fatalf("转换失败: %v", err)
+	}
+	if bytes.Contains(prepared.Body, []byte("UPSTREAM-NAME")) {
+		t.Fatalf("Gemini 目标不应把上游名写进报文: %s", prepared.Body)
+	}
+}
+
+func TestCrossDialectRewritesTopLevelModel(t *testing.T) {
+	engine := relay.NewEngine(relay.Options{})
+	// 其余三个方言的目标报文都在顶层有 model 字段，转换器自己用不用上游名都无所谓。
+	for _, to := range []dialect.Name{dialect.OpenAIChat, dialect.OpenAIResponses, dialect.ClaudeMessages} {
+		prepared, err := engine.PrepareRequest(context.Background(), relay.Request{
+			From: dialect.ClaudeMessages, To: to,
+			Body:        []byte(requestSamples[dialect.ClaudeMessages]),
+			OriginModel: "m1", UpstreamModel: "UPSTREAM-NAME",
+		})
+		if err != nil {
+			t.Fatalf("%s: 转换失败: %v", to, err)
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(prepared.Body, &decoded); err != nil {
+			t.Fatalf("%s: 解析失败: %v", to, err)
+		}
+		if decoded["model"] != "UPSTREAM-NAME" {
+			t.Fatalf("%s: 顶层 model 应为上游名，实际 %v", to, decoded["model"])
 		}
 	}
 }

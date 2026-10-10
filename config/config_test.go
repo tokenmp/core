@@ -94,6 +94,86 @@ func TestResolveKeepsConfigOrder(t *testing.T) {
 	}
 }
 
+func TestResolveUpstreamPlaceholder(t *testing.T) {
+	cfg, err := config.Parse(strings.NewReader(`
+channels:
+  - {name: deepseek, dialect: openai, base_url: "https://x"}
+  - {name: proxy, dialect: claude, base_url: "https://y"}
+models:
+  - {match: "deepseek-*", channel: deepseek, upstream: "deepseek/${model}"}
+  - {match: "openai/*", channel: proxy, upstream: "proxy/${model}"}
+  - {match: "literal", channel: deepseek, upstream: "a$$b"}
+`))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if routes := cfg.Resolve("deepseek-v3"); len(routes) != 1 || routes[0].Upstream != "deepseek/deepseek-v3" {
+		t.Fatalf("${model} 应替换成模型名: %+v", routes)
+	}
+	// 带 / 的模型名要整体替换，不能被当成路径分段。
+	if routes := cfg.Resolve("openai/gpt-5"); len(routes) != 1 || routes[0].Upstream != "proxy/openai/gpt-5" {
+		t.Fatalf("带 / 的模型名应整体替换: %+v", routes)
+	}
+	// $ 不紧跟 { 时是普通字符，两个 $ 就是两个美元符号。
+	if routes := cfg.Resolve("literal"); len(routes) != 1 || routes[0].Upstream != "a$$b" {
+		t.Fatalf("字面 $$ 应原样保留: %+v", routes)
+	}
+}
+
+func TestValidateUpstreamPlaceholders(t *testing.T) {
+	const channel = `
+channels:
+  - {name: a, dialect: openai, base_url: "https://x"}
+`
+	ok := []struct {
+		name string
+		rule string
+	}{
+		{"${model} 合法", `{match: "m", channel: a, upstream: "pre/${model}"}`},
+		{"字面 $$ 是普通字符", `{match: "m", channel: a, upstream: "a$$b"}`},
+		{"单个 } 是普通字符", `{match: "m", channel: a, upstream: "a}b"}`},
+	}
+	for _, item := range ok {
+		t.Run(item.name, func(t *testing.T) {
+			if _, err := config.Parse(strings.NewReader(channel + "models:\n  - " + item.rule + "\n")); err != nil {
+				t.Fatalf("不应报错: %v", err)
+			}
+		})
+	}
+
+	bad := []struct {
+		name     string
+		rule     string
+		keywords []string
+	}{
+		{
+			name:     "未知占位符",
+			rule:     `{match: "m", channel: a, upstream: "pre/${unknown}"}`,
+			keywords: []string{"models[1]", "不是支持的占位符"},
+		},
+		{
+			name:     "未闭合的 ${",
+			rule:     `{match: "m", channel: a, upstream: "pre/${model"}`,
+			keywords: []string{"models[1]", "没有配对的"},
+		},
+	}
+	for _, item := range bad {
+		t.Run(item.name, func(t *testing.T) {
+			// 前面放一条合法规则，用来确认报错指出的下标是出问题的那条。
+			yaml := channel + "models:\n  - {match: \"ok\", channel: a}\n  - " + item.rule + "\n"
+			_, err := config.Parse(strings.NewReader(yaml))
+			if err == nil {
+				t.Fatal("应当报错")
+			}
+			for _, keyword := range item.keywords {
+				if !strings.Contains(err.Error(), keyword) {
+					t.Fatalf("错误信息应包含 %q，实际: %v", keyword, err)
+				}
+			}
+		})
+	}
+}
+
 func TestEnabledPluginsSortedByOrder(t *testing.T) {
 	cfg, err := config.Parse(strings.NewReader(sample))
 	if err != nil {
