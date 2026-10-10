@@ -96,6 +96,9 @@ func (r *Reader) Next() (Event, error) {
 //
 // 用 ReadSlice 逐段拼，而不是 ReadString：ReadString 会把整行先读进内存再返回，
 // 上游发一条不含换行的超长行就能把内存吃满。这里每读一段都对照上限。
+//
+// 读到的行连同 io.EOF 一起返回时，先把行交给调用方，下一次调用才返回 EOF。
+// 反过来做会丢掉上游最后一行没有收尾换行符时的那一行。
 func (r *Reader) readLine() (string, error) {
 	var line []byte
 	for {
@@ -108,8 +111,13 @@ func (r *Reader) readLine() (string, error) {
 			if len(line) > r.maxEventBytes {
 				return "", fmt.Errorf("%w: 单行超过 %d 字节", ErrEventTooLarge, r.maxEventBytes)
 			}
+		case len(line) > 0:
+			if len(line) > r.maxEventBytes {
+				return "", fmt.Errorf("%w: 单行超过 %d 字节", ErrEventTooLarge, r.maxEventBytes)
+			}
+			return trimLineEnding(line), nil
 		default:
-			return trimLineEnding(line), err
+			return "", err
 		}
 	}
 }

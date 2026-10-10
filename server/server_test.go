@@ -495,6 +495,32 @@ models:
 	}
 }
 
+func TestLastBrokenChunkWithoutNewlineIsNotSilentlyDropped(t *testing.T) {
+	// 上游在最后一段送半截 JSON 且不补换行符就断开。这一段必须被读到并报错，
+	// 而不是因为读行时连错误一起丢掉，让截断看起来像正常结束。
+	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte(`data: {"id":"1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"你"}}]}` + "\n\n"))
+		_, _ = writer.Write([]byte("data: {坏 JSON"))
+	})
+	front := newServer(t, `
+channels:
+  - {name: upstream, dialect: openai, base_url: "`+upstreamServer.URL+`"}
+models:
+  - {match: "client-model", channel: upstream}
+`, "")
+
+	status, _, body := post(t, front.URL+"/v1/messages",
+		`{"model":"client-model","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"你好"}]}`)
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d", status)
+	}
+	if strings.Contains(string(body), "message_stop") {
+		t.Fatalf("最后一段损坏时不应补出终止帧: %s", body)
+	}
+}
+
 func TestRouteDialectOverridesChannelDialect(t *testing.T) {
 	// 渠道默认说 OpenAI，模型规则把它改写成 Gemini。上游路径必须跟着规则走，
 	// 否则请求会带着 Gemini 的请求体打到 OpenAI 的路径上。

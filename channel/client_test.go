@@ -307,6 +307,45 @@ func TestSSEWriterRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSSEReaderKeepsLineWithoutTrailingNewline(t *testing.T) {
+	// 上游的最后一行常常没有收尾换行符。读行时若把行连同 io.EOF 一起丢掉，
+	// 那一段内容就消失了，下游看到的是一个被截断却像正常结束的流。
+	cases := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{"最后一行无换行", "data: 第一行\ndata: 第二行", []string{"第一行\n第二行"}},
+		{"最后一行有换行", "data: 第一行\ndata: 第二行\n", []string{"第一行\n第二行"}},
+		{"单行无换行", "data: 只有一行", []string{"只有一行"}},
+		{"坏 JSON 也要读出来", "data: {\"a\":1}\n\ndata: {坏", []string{`{"a":1}`, "{坏"}},
+	}
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			reader := channel.NewReader(strings.NewReader(item.input))
+			var got []string
+			for {
+				event, err := reader.Next()
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				if err != nil {
+					t.Fatalf("读取失败: %v", err)
+				}
+				got = append(got, string(event.Data))
+			}
+			if len(got) != len(item.want) {
+				t.Fatalf("事件数不符: 期望 %d，实际 %d (%q)", len(item.want), len(got), got)
+			}
+			for index := range got {
+				if got[index] != item.want[index] {
+					t.Fatalf("第 %d 条事件不符: 期望 %q，实际 %q", index+1, item.want[index], got[index])
+				}
+			}
+		})
+	}
+}
+
 func TestSSEReaderBoundsLineLength(t *testing.T) {
 	reader := channel.NewReader(strings.NewReader(strings.Repeat("x", 1<<20)))
 	reader.SetMaxEventBytes(1024)
