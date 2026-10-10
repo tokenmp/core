@@ -19,6 +19,11 @@
 | golang.org/x/text | v0.35.0 | BSD-3-Clause |
 | gopkg.in/yaml.v3 | v3.0.1 | MIT 与 Apache-2.0 双许可 |
 
+`github.com/tidwall/sjson` 是直接依赖：[relay](relay) 用它把上游请求报文
+顶层的 `model` 字段做逐字节定点改写。只改一个字段而不重建报文，
+未建模字段与多余空白才能原样保留。`gjson`、`match`、`pretty` 是它拉进来的
+传递依赖，因此仍标为间接。
+
 ## 只出现在 go.mod 里的测试依赖
 
 `go.mod` 还记着 `github.com/kr/text v0.2.0`。它不属于本模块的编译图，
