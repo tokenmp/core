@@ -707,3 +707,36 @@ models:
 		t.Fatalf("中断行与完成行的 request_id 不同: %v / %v", interrupted, done)
 	}
 }
+
+// TestAccessLogReportsTopLevelCacheHit 覆盖只把缓存读报在顶层 prompt_cache_hit_tokens
+// 的上游（DeepSeek 那类写法），details 为空。这一处与跨方言的两个 details 字段是同一个
+// 概念，宿主看到的命中率不该因为上游换了一种写法就变成 0。
+func TestAccessLogReportsTopLevelCacheHit(t *testing.T) {
+	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, `{"id":"chatcmpl-1","object":"chat.completion","created":1,`+
+			`"model":"upstream-model",`+
+			`"choices":[{"index":0,"message":{"role":"assistant","content":"你好"},"finish_reason":"stop"}],`+
+			`"usage":{"prompt_tokens":1768,"completion_tokens":2,"total_tokens":1770,`+
+			`"prompt_cache_hit_tokens":640}}`)
+	})
+	front, logs, outcomes := newSeamServer(t, `
+channels:
+  - {name: upstream, dialect: openai, base_url: "`+upstreamServer.URL+`"}
+models:
+  - {match: "client-model", channel: upstream}
+`)
+
+	status, _, body := post(t, front.URL+"/v1/messages",
+		`{"model":"client-model","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}`)
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d %s", status, body)
+	}
+	line := onlyLine(t, waitForLog(t, logs, "请求完成", 1), "请求完成")
+	if got := numberField(t, line, "cached_tokens"); got != 640 {
+		t.Fatalf("只报顶层 prompt_cache_hit_tokens 时 cached_tokens 不符: %v（完成行 %v）", got, line)
+	}
+	outcome := outcomes.wait(t, 1)[0]
+	if outcome.Usage == nil || outcome.Usage.CachedTokens != 640 {
+		t.Fatalf("只报顶层 prompt_cache_hit_tokens 时 Outcome 缓存读不符: %+v", outcome.Usage)
+	}
+}

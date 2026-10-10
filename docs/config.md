@@ -138,7 +138,9 @@ Gemini 的路径含模型名，不支持覆盖。
 `cached_tokens`，有缓存写入时加 `cache_write_tokens`。
 `prompt_tokens` 已经含缓存读与缓存写，命中率的分母直接用它即可。
 缓存读取自归一之后的 `prompt_tokens_details.cached_tokens`
-或 `input_tokens_details.cached_tokens`，两个都有值时取较大者。
+或 `input_tokens_details.cached_tokens`，两个都有值时取较大者；
+只把缓存读报在顶层 `prompt_cache_hit_tokens` 的上游先由转换层搬进 details，
+两种写法在这里是同一个数。
 缓存写把 Claude 的 `cached_creation_tokens` 与 OpenAI 的
 `cache_write_tokens` 合并成一个数，两者都有值时同样取较大者；
 同方言透传时原样转发、不解析用量，所以完成行里也就不会有这些 token 字段。

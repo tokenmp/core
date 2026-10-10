@@ -135,16 +135,32 @@ func (r *accessRecord) recordUsage(usage *dto.Usage) {
 	r.cacheWriteTokens = cacheWriteTokensOf(usage)
 }
 
+// canonicalUsageOf 取归一之后的用量。
+//
+// 缓存读可能报在顶层 prompt_cache_hit_tokens（DeepSeek 那类写法），也可能报在
+// prompt_tokens_details 或 input_tokens_details 里。BillingUsage 是 RelayKit 保留的
+// 原始用量快照，CanonicalUsage 把前一种写法搬进 details，因此有快照就用它归一的
+// 结果；直接读扁平字段会让前一种上游的缓存量恒为 0。快照缺失或不认识时退回原值。
+func canonicalUsageOf(usage *dto.Usage) *dto.Usage {
+	if usage.BillingUsage == nil {
+		return usage
+	}
+	if canonical, ok := usage.BillingUsage.CanonicalUsage(); ok && canonical != nil {
+		return canonical
+	}
+	return usage
+}
+
 // cachedTokensOf 取归一之后的缓存读量。
 //
-// 转换后的用量把缓存读放在 prompt_tokens_details 或 input_tokens_details 里，顶层
-// prompt_cache_hit_tokens 是空的，直接读它恒为 0。两个 details 都有值时取较大者，
-// 与缓存写的合并口径一致；负值归零，避免拉低宿主算的命中率。
+// 两个 details 都有值时取较大者，与缓存写的合并口径一致；负值归零，避免拉低
+// 宿主算的命中率。
 func cachedTokensOf(usage *dto.Usage) int {
-	fromPrompt := usage.PromptTokensDetails.CachedTokens
+	canonical := canonicalUsageOf(usage)
+	fromPrompt := canonical.PromptTokensDetails.CachedTokens
 	fromInput := 0
-	if usage.InputTokensDetails != nil {
-		fromInput = usage.InputTokensDetails.CachedTokens
+	if canonical.InputTokensDetails != nil {
+		fromInput = canonical.InputTokensDetails.CachedTokens
 	}
 	return max(fromPrompt, fromInput, 0)
 }
@@ -155,9 +171,10 @@ func cachedTokensOf(usage *dto.Usage) int {
 // CacheCreationTokensTotal 合并取较大者并把负值归零，这里不重复实现。两个 details
 // 都有值时同样取较大者，避免同一批 token 被算两次。
 func cacheWriteTokensOf(usage *dto.Usage) int {
-	total := usage.PromptTokensDetails.CacheCreationTokensTotal()
-	if usage.InputTokensDetails != nil {
-		total = max(total, usage.InputTokensDetails.CacheCreationTokensTotal())
+	canonical := canonicalUsageOf(usage)
+	total := canonical.PromptTokensDetails.CacheCreationTokensTotal()
+	if canonical.InputTokensDetails != nil {
+		total = max(total, canonical.InputTokensDetails.CacheCreationTokensTotal())
 	}
 	return total
 }
