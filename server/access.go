@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
 )
@@ -22,6 +23,9 @@ type accessRecord struct {
 	method    string
 	path      string
 	client    string
+	// userAgent 是请求头里的 User-Agent，已经过 clipUserAgent 截断。它和 client 一起
+	// 用来认客户端：默认只听 127.0.0.1 时 client 恒为 127.0.0.1，认不出是谁在调用。
+	userAgent string
 	started   time.Time
 	status    int
 	model     string
@@ -100,6 +104,7 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 			method:    request.Method,
 			path:      request.URL.Path,
 			client:    clientAddress(request.RemoteAddr),
+			userAgent: clipUserAgent(request.UserAgent()),
 			// started 取在写进入行之前。duration 记的是客户端等待的时长，日志 sink 慢
 			// 带来的拖延也一样拖了客户端，不该从这段时长里排除掉。
 			started: s.now(),
@@ -129,9 +134,8 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 // 持续几分钟，这期间日志里看不出请求正在跑；请求卡住或进程被杀时，至少还留下这一行。
 //
 // 代价是每个请求多一行，默认级别下日志量翻倍。换到的只有时序：字段是完成行里在进入
-// 时就已经确定的那四个，两行因此可以逐字段对照。User-Agent 与会话标识在进入时也已经
-// 知道，但访问日志的两行都不带它们；要不要把这两个收进字段集是另一个决定，不该由这
-// 一行顺手定下。
+// 时就已经确定的那五个，两行因此可以逐字段对照。会话标识在进入时也已经知道，但访问
+// 日志的两行都不带它；要不要把它收进字段集是另一个决定，不该由这一行顺手定下。
 //
 // 记 INFO 而不是 DEBUG。进入时还不知道结果，没有状态码可以分级；而默认的 log.level
 // 是 info，把进入行记成 DEBUG 等于默认看不见，上面那点可见性就拿不到。
@@ -140,7 +144,8 @@ func (s *Server) logArrival(record *accessRecord) {
 		"request_id", record.requestID,
 		"method", record.method,
 		"path", record.path,
-		"client", record.client)
+		"client", record.client,
+		"user_agent", record.userAgent)
 }
 
 // logAccess 写出完成行。
@@ -164,6 +169,7 @@ func (s *Server) logAccess(record *accessRecord) {
 		"channel", record.channel,
 		"attempts", record.attempts,
 		"client", record.client,
+		"user_agent", record.userAgent,
 	}
 	if record.hasUsage {
 		attrs = append(attrs,
@@ -187,6 +193,30 @@ func (s *Server) logAccess(record *accessRecord) {
 // 「生成失败」这条路径。id 只在日志里出现，不参与任何路由或鉴权判断。
 func (s *Server) newRequestID() string {
 	return strconv.FormatUint(s.requestCounter.Add(1), 10)
+}
+
+// maxUserAgentBytes 是写进日志的 User-Agent 字节上限。
+//
+// 真实客户端的 UA 远短于这个值（curl 十来字节，各家 SDK 一两百字节），
+// 因此截断不影响用这个字段认客户端。
+const maxUserAgentBytes = 256
+
+// clipUserAgent 把 User-Agent 截到上限之内。
+//
+// 请求头由客户端控制，而 Server 没有设 http.Server.MaxHeaderBytes，走 Go 默认的
+// 1 MiB；访问日志每个请求写两行，不截断的话一个请求就能往日志里灌进两兆字节。
+//
+// 截断点回退到 UTF-8 字符边界，不让半个字符进日志。落单的半个字符虽然会被 slog
+// 转义成合法输出，但那串 \xNN 是纯粹的噪声。
+func clipUserAgent(userAgent string) string {
+	if len(userAgent) <= maxUserAgentBytes {
+		return userAgent
+	}
+	cut := maxUserAgentBytes
+	for cut > 0 && !utf8.RuneStart(userAgent[cut]) {
+		cut--
+	}
+	return userAgent[:cut] + "…"
 }
 
 // clientAddress 从 RemoteAddr 里去掉端口。取不出主机时用原值。

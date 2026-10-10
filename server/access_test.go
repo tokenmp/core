@@ -281,6 +281,60 @@ models:
 	}
 }
 
+// TestAccessLogReportsUserAgent 覆盖客户端标识：两行都带 user_agent。
+//
+// 默认只听 127.0.0.1 时 client 恒为 127.0.0.1，认不出是谁在调用，user_agent 补上这一点。
+func TestAccessLogReportsUserAgent(t *testing.T) {
+	front, logs := newLoggingServer(t, `
+channels:
+  - {name: upstream, dialect: openai, base_url: "https://example.com"}
+models:
+  - {match: "client-model", channel: upstream}
+`)
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, front.URL+"/healthz", nil)
+	if err != nil {
+		t.Fatalf("构造请求失败: %v", err)
+	}
+	request.Header.Set("User-Agent", "claude-cli/2.1.287 (external, cli)")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	_ = response.Body.Close()
+
+	lines := waitForLog(t, logs, "请求完成", 1)
+	for _, msg := range []string{"请求进入", "请求完成"} {
+		assertField(t, onlyLine(t, lines, msg), "user_agent", "claude-cli/2.1.287 (external, cli)")
+	}
+}
+
+// TestAccessLogReportsEmptyUserAgent 覆盖客户端不发这个请求头：字段留空串，
+// 读日志的人不用去分辨「没这个键」与「值为空」。
+func TestAccessLogReportsEmptyUserAgent(t *testing.T) {
+	front, logs := newLoggingServer(t, `
+channels:
+  - {name: upstream, dialect: openai, base_url: "https://example.com"}
+models:
+  - {match: "client-model", channel: upstream}
+`)
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, front.URL+"/healthz", nil)
+	if err != nil {
+		t.Fatalf("构造请求失败: %v", err)
+	}
+	// 显式置空，压掉 Go 客户端自带的默认 User-Agent。
+	request.Header.Set("User-Agent", "")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	_ = response.Body.Close()
+
+	lines := waitForLog(t, logs, "请求完成", 1)
+	for _, msg := range []string{"请求进入", "请求完成"} {
+		assertField(t, onlyLine(t, lines, msg), "user_agent", "")
+	}
+}
+
 // TestStreamingAccessLogKeepsFlusher 覆盖流式路径：请求完成后留一行，并且包装层
 // 必须把 http.Flusher 透传出去。
 //

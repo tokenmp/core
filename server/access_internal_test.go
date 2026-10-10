@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // TestAccessWriterForwardsFlush 覆盖最容易踩的一处：包装层吃掉 Flush 会让流式响应
@@ -83,6 +84,39 @@ func TestAccessMiddlewareLogsArrivalBeforeHandlerReturns(t *testing.T) {
 	<-done
 	if text := logs.String(); !strings.Contains(text, `"msg":"请求完成"`) {
 		t.Fatalf("处理器返回后应当写出完成行: %s", text)
+	}
+}
+
+// TestClipUserAgent 覆盖 User-Agent 的截断。
+//
+// 这个请求头由客户端控制，服务端没有设 http.Server.MaxHeaderBytes，走 Go 默认的
+// 1 MiB；访问日志每个请求写两行，不截断的话一个请求就能往日志里灌进两兆字节。
+func TestClipUserAgent(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "空串原样", in: "", want: ""},
+		{name: "短的不动", in: "curl/8.5.0", want: "curl/8.5.0"},
+		{name: "恰好到上限不动", in: strings.Repeat("a", maxUserAgentBytes), want: strings.Repeat("a", maxUserAgentBytes)},
+		{name: "超一个字节就截", in: strings.Repeat("a", maxUserAgentBytes+1), want: strings.Repeat("a", maxUserAgentBytes) + "…"},
+		// 截断点落在「中」的三个字节中间，应当回退到字符边界，而不是切出半个字符。
+		{name: "截断点落在多字节字符中间时回退", in: strings.Repeat("a", maxUserAgentBytes-1) + "中", want: strings.Repeat("a", maxUserAgentBytes-1) + "…"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := clipUserAgent(testCase.in)
+			if got != testCase.want {
+				t.Fatalf("截断结果不符：期望 %q，实际 %q", testCase.want, got)
+			}
+			if !utf8.ValidString(got) {
+				t.Fatalf("截断结果不是合法 UTF-8: %q", got)
+			}
+			if len(got) > maxUserAgentBytes+len("…") {
+				t.Fatalf("截断之后还是太长：%d 字节", len(got))
+			}
+		})
 	}
 }
 
