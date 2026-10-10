@@ -17,7 +17,7 @@ import (
 // 直接对着包装层断言，不依赖端到端时序。
 func TestAccessWriterForwardsFlush(t *testing.T) {
 	recorder := httptest.NewRecorder()
-	writer := &accessWriter{ResponseWriter: recorder, record: &accessRecord{}}
+	writer := &accessWriter{ResponseWriter: recorder, record: &accessRecord{}, now: time.Now}
 	flusher, ok := http.ResponseWriter(writer).(http.Flusher)
 	if !ok {
 		t.Fatal("包装层没有转发 http.Flusher：流式响应会静默退化成不刷新")
@@ -35,7 +35,7 @@ func TestAccessWriterForwardsFlush(t *testing.T) {
 // net/http 会按 200 写响应头，记录也要按 200 记。
 func TestAccessWriterRecordsImplicitStatus(t *testing.T) {
 	record := &accessRecord{}
-	writer := &accessWriter{ResponseWriter: httptest.NewRecorder(), record: record}
+	writer := &accessWriter{ResponseWriter: httptest.NewRecorder(), record: record, now: time.Now}
 	if _, err := writer.Write([]byte("ok")); err != nil {
 		t.Fatalf("写出失败: %v", err)
 	}
@@ -125,6 +125,77 @@ func TestClipLogValue(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestOutcomeForHandlerThatWritesNothing 覆盖处理器什么都没写的边界：FirstByte 与
+// BytesWritten 都是 0，宿主据此知道 TTFT 无从计算。状态码仍按 200 记，与 net/http
+// 在处理器返回时补写响应头的行为一致。
+func TestOutcomeForHandlerThatWritesNothing(t *testing.T) {
+	var got Outcome
+	called := false
+	service := &Server{
+		logger: slog.New(slog.DiscardHandler),
+		now:    time.Now,
+		onRequestDone: func(outcome Outcome) {
+			called = true
+			got = outcome
+		},
+	}
+	handler := service.withAccessLog(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	handler.ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/nothing", nil))
+
+	if !called {
+		t.Fatal("设了回调就该被调用")
+	}
+	if got.Status != http.StatusOK {
+		t.Fatalf("处理器没写响应头时状态按 200 记: %d", got.Status)
+	}
+	if got.FirstByte != 0 || got.BytesWritten != 0 {
+		t.Fatalf("什么都没写时首字节时间与字节数都应当是 0: %+v", got)
+	}
+}
+
+// TestOutcomeCallbackPanicIsContained 覆盖宿主回调 panic：吞掉并记一行 ERROR，
+// 不冒到 net/http 的恢复逻辑去。
+func TestOutcomeCallbackPanicIsContained(t *testing.T) {
+	logs := &bytes.Buffer{}
+	service := &Server{
+		logger:        slog.New(slog.NewJSONHandler(logs, nil)),
+		now:           time.Now,
+		onRequestDone: func(Outcome) { panic("宿主回调故意失败") },
+	}
+	handler := service.withAccessLog(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+	}))
+	// 这里不 recover：回调的 panic 不该冒上来。
+	handler.ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/boom", nil))
+
+	if text := logs.String(); !strings.Contains(text, "请求结束回调 panic") {
+		t.Fatalf("回调 panic 应当留一行 ERROR: %s", text)
+	}
+}
+
+// TestOutcomeCallbackPanicKeepsHandlerPanic 覆盖两者都 panic：回调的失败不能盖掉
+// 处理器已经抛出的那个，否则真正的原因就从日志里消失了。
+func TestOutcomeCallbackPanicKeepsHandlerPanic(t *testing.T) {
+	service := &Server{
+		logger:        slog.New(slog.DiscardHandler),
+		now:           time.Now,
+		onRequestDone: func(Outcome) { panic("宿主回调的失败") },
+	}
+	handler := service.withAccessLog(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic("处理器的失败")
+	}))
+
+	defer func() {
+		if recovered := recover(); recovered != "处理器的失败" {
+			t.Fatalf("抛出的应当是处理器的 panic，实际 %v", recovered)
+		}
+	}()
+	handler.ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/boom", nil))
 }
 
 // TestAccessMiddlewareLogsPanic 覆盖处理器 panic：这条请求确实失败了，不能按

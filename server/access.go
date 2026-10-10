@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"strconv"
@@ -9,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/tokenmp/core/config"
 )
 
 // accessRecord 是一次请求的访问记录。
@@ -42,6 +44,14 @@ type accessRecord struct {
 	completionTokens int
 	totalTokens      int
 	cachedTokens     int
+	// firstByteAt 与 bytesWritten 只有包装层知道，事后再采就晚了，因此在请求路径上采集；
+	// 它们与 streaming 都只给交回宿主的 Outcome 用。
+	firstByteAt  time.Time
+	bytesWritten int64
+	streaming    bool
+	// tries 按顺序记下每条候选的尝试，访问日志的 attempts 与交回宿主的
+	// Outcome.Attempts 都是它，两个出口因此不会对不上。
+	tries []Attempt
 }
 
 // accessRecordKey 是记录在 context 里的键。用私有类型避免与别的包撞键。
@@ -75,13 +85,37 @@ func (r *accessRecord) setModel(model string) {
 	r.model = clipLogValue(model)
 }
 
-// served 记下实际服务的那条渠道，以及一共尝试了几条候选。
-func (r *accessRecord) served(channel string, attempts int) {
+// served 记下实际服务的那条渠道。
+//
+// 尝试条数由 recordAttempt 记下的列表长度得出，不另行传入：两个来源分开维护迟早会对不上。
+func (r *accessRecord) served(channel string) {
 	if r == nil {
 		return
 	}
 	r.channel = channel
-	r.attempts = attempts
+	r.attempts = len(r.tries)
+}
+
+// recordAttempt 记下一次候选尝试。status 为 0 表示没拿到上游响应。
+func (r *accessRecord) recordAttempt(route config.Route, status int, duration time.Duration) {
+	if r == nil {
+		return
+	}
+	r.tries = append(r.tries, Attempt{
+		Channel:  route.Channel,
+		Dialect:  route.Dialect,
+		Upstream: route.Upstream,
+		Status:   status,
+		Duration: duration,
+	})
+}
+
+// setStream 记下客户端是否要求流式。
+func (r *accessRecord) setStream(streaming bool) {
+	if r == nil {
+		return
+	}
+	r.streaming = streaming
 }
 
 // recordUsage 记下这次请求的用量。上游没给用量时保持原样。
@@ -114,7 +148,7 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 			started: s.now(),
 		}
 		s.logArrival(record)
-		tracked := &accessWriter{ResponseWriter: writer, record: record}
+		tracked := &accessWriter{ResponseWriter: writer, record: record, now: s.now}
 		ctx := context.WithValue(request.Context(), accessRecordKey{}, record)
 		defer func() {
 			if recovered := recover(); recovered != nil {
@@ -122,10 +156,10 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 				// 未写响应头的默认值记成 200。抛出之后 net/http 原有的 panic
 				// 处理，以及 http.ErrAbortHandler 的语义都不变。
 				record.status = http.StatusInternalServerError
-				s.logAccess(record)
+				s.finish(record)
 				panic(recovered)
 			}
-			s.logAccess(record)
+			s.finish(record)
 		}()
 		next.ServeHTTP(tracked, request.WithContext(ctx))
 	})
@@ -159,11 +193,7 @@ func (s *Server) logArrival(record *accessRecord) {
 // 因此服务只要在跑就能看见每个请求，包括同方言透传这条最常见的路径；失败请求
 // 与既有的 WARN 行同级，一起由 log.level 控制。
 func (s *Server) logAccess(record *accessRecord) {
-	status := record.status
-	if status == 0 {
-		// 处理器没有显式调 WriteHeader：net/http 会按 200 写响应头。
-		status = http.StatusOK
-	}
+	status := effectiveStatus(record)
 	attrs := []any{
 		"request_id", record.requestID,
 		"method", record.method,
@@ -188,6 +218,72 @@ func (s *Server) logAccess(record *accessRecord) {
 		return
 	}
 	s.logger.Warn("请求完成", attrs...)
+}
+
+// effectiveStatus 返回这次请求的状态码。处理器没有显式写响应头时按 200 记，
+// 与 net/http 的行为一致。
+func effectiveStatus(record *accessRecord) int {
+	if record.status == 0 {
+		return http.StatusOK
+	}
+	return record.status
+}
+
+// finish 收尾一次请求：写出完成行，并在宿主设了回调时把原始量交出去。
+func (s *Server) finish(record *accessRecord) {
+	s.logAccess(record)
+	s.notify(record)
+}
+
+// notify 把这次请求的原始量交给宿主。
+//
+// 回调是宿主代码，同步跑在请求自己的 goroutine 上。它 panic 时吞掉并记一行 ERROR：
+// 处理器已经抛出的 panic 不能被它盖掉，其余请求也不该被它连累。
+//
+// 没设回调时不构造 Outcome。尝试列表不在此列：访问日志的 attempts 就是它算出来的，
+// 不设回调也照记。
+func (s *Server) notify(record *accessRecord) {
+	if s.onRequestDone == nil {
+		return
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logger.Error("请求结束回调 panic",
+				"request_id", record.requestID,
+				"error", fmt.Sprint(recovered))
+		}
+	}()
+	s.onRequestDone(s.outcomeOf(record))
+}
+
+// outcomeOf 把访问记录整理成交给宿主的原始量。
+func (s *Server) outcomeOf(record *accessRecord) Outcome {
+	outcome := Outcome{
+		RequestID:    record.requestID,
+		Method:       record.method,
+		Path:         record.path,
+		Client:       record.client,
+		UserAgent:    record.userAgent,
+		Status:       effectiveStatus(record),
+		Duration:     s.now().Sub(record.started),
+		BytesWritten: record.bytesWritten,
+		Model:        record.model,
+		Channel:      record.channel,
+		Streaming:    record.streaming,
+		Attempts:     record.tries,
+	}
+	if !record.firstByteAt.IsZero() {
+		outcome.FirstByte = record.firstByteAt.Sub(record.started)
+	}
+	if record.hasUsage {
+		outcome.Usage = &Usage{
+			PromptTokens:     record.promptTokens,
+			CompletionTokens: record.completionTokens,
+			TotalTokens:      record.totalTokens,
+			CachedTokens:     record.cachedTokens,
+		}
+	}
+	return outcome
 }
 
 // newRequestID 生成进程内唯一的请求 id。
@@ -242,6 +338,8 @@ func clientAddress(remoteAddr string) string {
 type accessWriter struct {
 	http.ResponseWriter
 	record *accessRecord
+	// now 与 Server 用同一个时间源，便于测试替换。
+	now func() time.Time
 }
 
 // WriteHeader 只记第一个状态码，与 net/http 的行为一致。
@@ -249,15 +347,27 @@ func (w *accessWriter) WriteHeader(status int) {
 	if w.record.status == 0 {
 		w.record.status = status
 	}
+	w.markFirstByte()
 	w.ResponseWriter.WriteHeader(status)
 }
 
-// Write 在处理器没有显式调 WriteHeader 时记下 200：net/http 会按 200 写响应头。
+// Write 在处理器没有显式调 WriteHeader 时记下 200：net/http 会按 200 写响应头，
+// 同时累加写出的字节数。
 func (w *accessWriter) Write(body []byte) (int, error) {
 	if w.record.status == 0 {
 		w.record.status = http.StatusOK
 	}
-	return w.ResponseWriter.Write(body)
+	w.markFirstByte()
+	written, err := w.ResponseWriter.Write(body)
+	w.record.bytesWritten += int64(written)
+	return written, err
+}
+
+// markFirstByte 记下首次写出的时刻。写响应头或写响应体，先到的那个算。
+func (w *accessWriter) markFirstByte() {
+	if w.record.firstByteAt.IsZero() {
+		w.record.firstByteAt = w.now()
+	}
 }
 
 // Flush 无条件转发到底层。

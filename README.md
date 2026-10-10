@@ -65,6 +65,25 @@ func main() {
 服务给每个进入的请求记两行访问日志（进入与完成），用传进来的 logger 写出，
 级别按配置的 `log.level` 定。字段与级别口径见[配置规范](docs/config.md)的「访问日志」一节。
 
+宿主想在每次请求结束时记自己的指标，用 `WithRequestDone` 拿原始量：
+
+```go
+service, err := server.FromConfig(cfg, logger, server.WithRequestDone(func(outcome server.Outcome) {
+    // TTFT 与 TPS 的口径由宿主定，core 只交原始量。
+    logger.Info("请求结束",
+        "ttft", outcome.FirstByte,
+        "duration", outcome.Duration,
+        "bytes", outcome.BytesWritten,
+        "streaming", outcome.Streaming,
+        "attempts", len(outcome.Attempts))
+}))
+```
+
+`Outcome` 带首字节时间、写出字节数、每次候选尝试的耗时与状态、用量、模型与渠道。
+core 不算指标：TTFT 从请求进入算还是从上游首字节算、TPS 的分母取总时长还是
+生成时长，口径随宿主变，算出来的一定不合宿主的意。回调在请求的 goroutine 上
+同步调用，它 panic 会被吞掉并记一行 ERROR，不连累别的请求。
+
 只用转换内核、不起服务也是支持的：
 
 ```go

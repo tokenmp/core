@@ -49,6 +49,17 @@ type Options struct {
 	Now func() time.Time
 	// MaxBodyBytes 是单个请求体的上限，为 0 时用 config.DefaultMaxBodyBytes。
 	MaxBodyBytes int64
+	// OnRequestDone 在每次请求结束时同步调用，交出这次请求的原始量。
+	// 为 nil 时什么也不做，也不构造 Outcome。
+	OnRequestDone func(Outcome)
+}
+
+// Option 覆盖 FromConfig 的装配参数。
+type Option func(*Options)
+
+// WithRequestDone 设置每次请求结束时调用的回调，见 Options.OnRequestDone。
+func WithRequestDone(onDone func(Outcome)) Option {
+	return func(options *Options) { options.OnRequestDone = onDone }
 }
 
 // Server 是一个转发服务。
@@ -67,6 +78,8 @@ type Server struct {
 	affinityTable *affinity.Table
 	// minPrefixBytes 是前缀的字节下限，短于它时不做亲和。零表示不判断。
 	minPrefixBytes int
+	// onRequestDone 是宿主的请求结束回调，为 nil 表示不回调。
+	onRequestDone func(Outcome)
 }
 
 // New 创建服务。
@@ -111,6 +124,7 @@ func New(opts Options) (*Server, error) {
 			now,
 		),
 		minPrefixBytes: opts.Config.AffinityMinPrefixBytes(),
+		onRequestDone:  opts.OnRequestDone,
 	}
 	server.handler = server.routes()
 	return server, nil
@@ -118,9 +132,12 @@ func New(opts Options) (*Server, error) {
 
 // FromConfig 按配置装配渠道与插件，再创建服务。
 //
+// opts 用来覆盖装配参数，不传时与只传 cfg 和 logger 的行为相同；要完全掌控装配
+// 就直接用 New。
+//
 // 配置里启用但目录里不存在的插件会直接报错：静默降级会让「插件没生效」变成
 // 一个只能靠读日志发现的问题。
-func FromConfig(cfg *config.Config, logger *slog.Logger) (*Server, error) {
+func FromConfig(cfg *config.Config, logger *slog.Logger, opts ...Option) (*Server, error) {
 	specs := make([]channel.Spec, 0, len(cfg.Channels))
 	for _, item := range cfg.Channels {
 		itemDialect, _ := dialect.Parse(item.Dialect)
@@ -143,12 +160,16 @@ func FromConfig(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return New(Options{
+	options := Options{
 		Config:   cfg,
 		Channels: channels,
 		Plugins:  plugins,
 		Logger:   logger,
-	})
+	}
+	for _, apply := range opts {
+		apply(&options)
+	}
+	return New(options)
 }
 
 // BuildPlugins 按配置加载插件目录并构造插件集合。

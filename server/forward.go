@@ -47,6 +47,7 @@ func (s *Server) forward(writer http.ResponseWriter, request *http.Request, clie
 	body, model = s.rewriteRequest(ctx, client, model, stream, body)
 	// 插件可能改过模型名，记录以改写后的为准。
 	accessOf(ctx).setModel(model)
+	accessOf(ctx).setStream(stream)
 	routes, rejected := usableRoutes(s.config.Resolve(model))
 	if len(routes) == 0 {
 		if rejected != "" {
@@ -115,9 +116,11 @@ func (s *Server) callUpstream(
 ) (*http.Response, *relay.Prepared, config.Route) {
 	var lastMessage string
 	for index, route := range routes {
+		started := s.now()
 		upstream, ok := s.channels.Get(route.Channel)
 		if !ok {
 			lastMessage = fmt.Sprintf("渠道 %s 不存在", route.Channel)
+			accessOf(ctx).recordAttempt(route, 0, s.now().Sub(started))
 			continue
 		}
 		prepared, err := s.engine.PrepareRequest(ctx, relay.Request{
@@ -131,6 +134,7 @@ func (s *Server) callUpstream(
 		if err != nil {
 			lastMessage = err.Error()
 			s.logger.Warn("请求转换失败", "request_id", requestIDOf(ctx), "route", routeOf(route), "error", err.Error())
+			accessOf(ctx).recordAttempt(route, 0, s.now().Sub(started))
 			continue
 		}
 		response, err := upstream.Send(ctx, channel.Request{
@@ -142,16 +146,19 @@ func (s *Server) callUpstream(
 		if err != nil {
 			lastMessage = err.Error()
 			s.logger.Warn("上游请求失败", "request_id", requestIDOf(ctx), "route", routeOf(route), "error", err.Error())
+			accessOf(ctx).recordAttempt(route, 0, s.now().Sub(started))
 			continue
 		}
 		if response.StatusCode >= http.StatusBadRequest {
 			if shouldTryNext(response.StatusCode, index, len(routes)) {
 				lastMessage = readErrorBody(response)
 				s.logger.Warn("上游拒绝请求，改试下一条路由", "request_id", requestIDOf(ctx), "route", routeOf(route), "status", response.StatusCode)
+				accessOf(ctx).recordAttempt(route, response.StatusCode, s.now().Sub(started))
 				continue
 			}
 			// 不可重试的状态，或已经是最后一条候选：原样交给调用方。
-			accessOf(ctx).served(route.Channel, index+1)
+			accessOf(ctx).recordAttempt(route, response.StatusCode, s.now().Sub(started))
+			accessOf(ctx).served(route.Channel)
 			return response, prepared, route
 		}
 		if len(prepared.Diagnostics()) > 0 {
@@ -161,14 +168,15 @@ func (s *Server) callUpstream(
 				"count", len(prepared.Diagnostics()),
 				"diagnostics", prepared.Diagnostics())
 		}
-		accessOf(ctx).served(route.Channel, index+1)
+		accessOf(ctx).recordAttempt(route, response.StatusCode, s.now().Sub(started))
+		accessOf(ctx).served(route.Channel)
 		return response, prepared, route
 	}
 	if lastMessage == "" {
 		lastMessage = "没有可用的候选路由"
 	}
 	// 候选全部试过：记下试了几条，渠道留空表示没有一条服务成功。
-	accessOf(ctx).served("", len(routes))
+	accessOf(ctx).served("")
 	s.writeError(ctx, writer, http.StatusBadGateway, "upstream_error", lastMessage)
 	return nil, nil, config.Route{}
 }
