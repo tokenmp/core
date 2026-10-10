@@ -116,15 +116,23 @@ Gemini 的路径含模型名，不支持覆盖。
 
 ## 访问日志
 
-每个进入服务的请求都会在完成时留一行，与两端方言是否相同、上游有没有给出用量无关。
+每个进入服务的请求留两行：请求进入时一行，完成时一行，
+与两端方言是否相同、上游有没有给出用量都无关。
 
-级别口径按状态码定，默认的 `log.level` 是 `info`。状态码小于 400 记 INFO，
-因此服务一跑起来就能看见每个请求，包括客户端与渠道同方言的透传这条最常见的路径；
-状态码 400 及以上记 WARN，与既有的失败日志同级，一起由 `log.level` 控制。
+进入行恒记 INFO，字段只有 `request_id`、`method`、`path`、`client`。
+`model` 与 `channel` 要等路由，`status`、`duration`、`attempts` 要等响应，
+这些只有完成行知道。进入行覆盖的是请求进来之后、结束之前那段空档：
+流式响应可能持续几分钟，请求卡住或进程被杀时也只留下这一行。
 
-失败路径上原有的 WARN 行保留，与完成行共享同一个 `request_id`，一次请求的几条日志靠它串起来。
+完成行的级别口径按状态码定，默认的 `log.level` 是 `info`。
+状态码小于 400 记 INFO，因此服务一跑起来就能看见每个请求，
+包括客户端与渠道同方言的透传这条最常见的路径；状态码 400 及以上记 WARN，
+与既有的失败日志同级，一起由 `log.level` 控制。
 
-字段有 `request_id`、`method`、`path`、`status`、`duration`、
+失败路径上原有的 WARN 行保留，与进入行、完成行共享同一个 `request_id`，
+一次请求的几条日志靠它串起来。
+
+完成行的字段有 `request_id`、`method`、`path`、`status`、`duration`、
 `model`、`channel`、`attempts`、`client`。跨方言转发且上游给出用量时另有
 `prompt_tokens`、`completion_tokens`、`total_tokens`，有缓存命中时加
 `cached_tokens`；同方言透传不解析用量，这一行也就没有 token 字段。

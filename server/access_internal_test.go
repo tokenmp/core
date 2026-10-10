@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -40,6 +41,64 @@ func TestAccessWriterRecordsImplicitStatus(t *testing.T) {
 	}
 	if record.status != http.StatusOK {
 		t.Fatalf("隐式状态码应当是 200，实际 %d", record.status)
+	}
+}
+
+// syncBuffer 是带锁的日志缓冲。处理器在另一个 goroutine 里写日志，直接读
+// bytes.Buffer 会构成数据竞争，-race 下会被报出来。
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(data []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(data)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestAccessMiddlewareLogsArrivalBeforeHandlerReturns 覆盖进入行的时序：处理器还在
+// 跑、请求尚未完成时，进入行就已经写出。
+//
+// 这正是进入行存在的理由——只靠完成行时，流式响应跑的几分钟里日志看不出请求正在跑，
+// 请求卡住或进程被杀时留下的是一条永远不会出现的完成行。
+func TestAccessMiddlewareLogsArrivalBeforeHandlerReturns(t *testing.T) {
+	logs := &syncBuffer{}
+	service := &Server{logger: slog.New(slog.NewJSONHandler(logs, nil)), now: time.Now}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	handler := service.withAccessLog(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release // 处理器停在这里，请求还没有完成
+		writer.WriteHeader(http.StatusOK)
+	}))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.ServeHTTP(httptest.NewRecorder(),
+			httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/slow", nil))
+	}()
+
+	<-entered
+	if text := logs.String(); !strings.Contains(text, `"msg":"请求进入"`) {
+		t.Fatalf("处理器尚未返回时应当已经写出进入行: %s", text)
+	}
+	if text := logs.String(); strings.Contains(text, `"msg":"请求完成"`) {
+		t.Fatalf("处理器尚未返回时不该有完成行: %s", text)
+	}
+
+	close(release)
+	<-done
+	if text := logs.String(); !strings.Contains(text, `"msg":"请求完成"`) {
+		t.Fatalf("处理器返回后应当写出完成行: %s", text)
 	}
 }
 
