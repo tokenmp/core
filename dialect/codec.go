@@ -177,11 +177,10 @@ func IsDoneMarker(data []byte) bool {
 var ErrUnsupportedPayload = errors.New("dialect: 载荷类型与方言不匹配")
 
 // CheckPayload 校验载荷类型是否与方言一致，供测试与断言使用。
+//
+// 载荷本身是 RelayKit 的 DTO，因此这个函数是给知道那套类型的调用方用的；
+// 只需要收发字节的调用方用不上它。
 func CheckPayload(name Name, value any) error {
-	format, ok := FromRelayFormat(name.RelayFormat())
-	if !ok || format != name {
-		return ErrUnsupportedPayload
-	}
 	switch name {
 	case OpenAIChat:
 		switch value.(type) {

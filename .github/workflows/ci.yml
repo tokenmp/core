@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   check:
+    name: check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -18,3 +19,19 @@ jobs:
       - uses: jdx/mise-action@v3
       - name: 门禁
         run: make check
+
+  # go.mod 声明的 go 指令是给使用者看的最低版本，只有真的在它上面编过一遍
+  # 才站得住。这个 job 用 setup-go 拿那个版本，不经过 mise。
+  min-go:
+    name: min-go
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: 按 go.mod 声明的最低版本编译与测试
+        run: |
+          go version
+          go build ./...
+          go test -race ./...

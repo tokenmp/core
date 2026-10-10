@@ -5,8 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/QuantumNous/new-api/relaykit/types"
-
 	"github.com/tokenmp/core/dialect"
 )
 
@@ -20,17 +18,9 @@ func TestNamesAndParse(t *testing.T) {
 		if !ok || parsed != name {
 			t.Fatalf("解析 %s 失败", name)
 		}
-		format := name.RelayFormat()
-		back, ok := dialect.FromRelayFormat(format)
-		if !ok || back != name {
-			t.Fatalf("%s 的 RelayFormat 往返失败: %s", name, format)
-		}
 	}
 	if _, ok := dialect.Parse("anthropic"); ok {
 		t.Fatal("未知识别出了方言")
-	}
-	if _, ok := dialect.FromRelayFormat(types.RelayFormatEmbedding); ok {
-		t.Fatal("非文本格式不应映射成方言")
 	}
 }
 

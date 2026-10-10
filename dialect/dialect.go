@@ -9,8 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-
-	"github.com/QuantumNous/new-api/relaykit/types"
 )
 
 // maxModelNameBytes 是写进 URL 路径的模型名上限。
@@ -82,38 +80,6 @@ func MustParse(s string) Name {
 		panic(fmt.Sprintf("dialect: 未知方言 %q", s))
 	}
 	return n
-}
-
-// RelayFormat 返回该方言在 RelayKit 里的对应格式。
-func (n Name) RelayFormat() types.RelayFormat {
-	switch n {
-	case OpenAIChat:
-		return types.RelayFormatOpenAI
-	case OpenAIResponses:
-		return types.RelayFormatOpenAIResponses
-	case ClaudeMessages:
-		return types.RelayFormatClaude
-	case GeminiGenerate:
-		return types.RelayFormatGemini
-	default:
-		return ""
-	}
-}
-
-// FromRelayFormat 把 RelayKit 的格式映射回方言。
-func FromRelayFormat(format types.RelayFormat) (Name, bool) {
-	switch format {
-	case types.RelayFormatOpenAI:
-		return OpenAIChat, true
-	case types.RelayFormatOpenAIResponses:
-		return OpenAIResponses, true
-	case types.RelayFormatClaude:
-		return ClaudeMessages, true
-	case types.RelayFormatGemini:
-		return GeminiGenerate, true
-	default:
-		return "", false
-	}
 }
 
 // LocalPath 返回本地端点接收该方言的路径。Gemini 的模型名在路径上，因此用

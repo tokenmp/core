@@ -14,6 +14,7 @@ channel/            上游渠道客户端与 SSE 读写
 plugin/             插件宿主
 config/             配置模型、加载与校验
 server/             HTTP 服务与装配
+internal/archtest/  结构守卫测试，不被任何包导入
 plugin-api/v1/      插件接口定义
 docs/               转换、插件、配置三份规范
 examples/           可直接复制的一份配置与一个插件
@@ -39,6 +40,10 @@ make tools      # 按 .mise.toml 装齐工具链
 
 公开面一旦发布就是兼容承诺。改公开函数的签名、删字段、改默认值都算破坏性变更，
 需要新的 tag 与升级说明。
+
+公开面里不出现上游模块的类型。`internal/archtest` 会逐个检查导出声明，违反即
+测试失败。例外只有两处用量字段，它们的理由写在 [docs/relay.md](docs/relay.md) 的
+「与 RelayKit 的关系」里；要新增例外必须同时写明理由。
 
 ## 分层红线
 
@@ -74,6 +79,7 @@ make tools      # 按 .mise.toml 装齐工具链
 - `plugin/examples_test.go` 与 `config/config_test.go` 会跑 `examples/` 下的配置与插件，
   改了示例必须让测试继续通过。
 - `server` 的测试用进程内假上游，不依赖真实网络。
+- `internal/archtest` 守着公开面，新增导出声明后跑一次即可确认没有引入上游类型。
 
 ## 文档
 
@@ -109,7 +115,7 @@ make tools      # 按 .mise.toml 装齐工具链
 - 实现走分支：`git checkout -b <type>/<短描述>`，完成后 `gh pr create`，
   标题符合 Conventional Commits，正文写 `Closes #<n>`
 - 合并用 squash：`gh pr merge --squash --delete-branch`
-- 合并前置：`make check` 全绿，CI 与 PR 标题检查通过，评审无未解决意见
+- 合并前置：`make check` 全绿，CI 两个 job 通过，评审无未解决意见
 - 不 force push `main`，不删除或改写已发布 tag，不批量关闭无关 Issue
 
 ## 提交

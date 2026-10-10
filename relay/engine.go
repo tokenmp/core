@@ -32,7 +32,7 @@ var ErrSameDialect = errors.New("relay: 源方言与目标方言相同，应按�
 type Options struct {
 	// ToolLossPolicy 决定请求转换遇到工具语义损耗时是否报错。默认 allow：
 	// 照常完成并把每条损耗写进诊断。响应与流式转换不受该策略影响。
-	ToolLossPolicy types.ConversionLossPolicy
+	ToolLossPolicy LossPolicy
 	// DefaultMaxTokens 返回源请求未带 max_tokens 时给 Claude 补的值。
 	// 为 nil 时用 DefaultClaudeMaxTokens。
 	DefaultMaxTokens func(model string) int
@@ -58,7 +58,7 @@ func NewEngine(opts Options) *Engine {
 	return &Engine{
 		suffix: opts.ModelSuffix,
 		options: convmeta.Options{
-			ToolLossPolicy: opts.ToolLossPolicy,
+			ToolLossPolicy: types.ConversionLossPolicy(opts.ToolLossPolicy),
 			Claude: convmeta.ClaudeOptions{
 				ThinkingAdapterEnabled: opts.ThinkingAdapter,
 				DefaultMaxTokens:       defaultMaxTokens,
@@ -74,7 +74,9 @@ func NewEngine(opts Options) *Engine {
 //
 // 未打开 ModelSuffix 时原样返回，状态为 nil。打开时识别各家已知尾缀，返回
 // 基础模型名与推理状态；识别不出尾缀时同样原样返回。
-func (e *Engine) ParseModel(model string) (string, *dto.ReasoningConversionState) {
+//
+// 调用方应当用返回的基础模型名去匹配路由规则，再去发请求。
+func (e *Engine) ParseModel(model string) (string, *Reasoning) {
 	if !e.suffix {
 		return model, nil
 	}
@@ -86,7 +88,7 @@ func (e *Engine) ParseModel(model string) (string, *dto.ReasoningConversionState
 	if state == nil {
 		return base, nil
 	}
-	return base, state
+	return base, reasoningOf(state)
 }
 
 // Prepared 是转换后的上游请求。
@@ -97,16 +99,25 @@ type Prepared struct {
 	Body []byte
 	// Stream 是客户端请求的流式意图。
 	Stream bool
-	// Result 是转换结果，Passthrough 时为 nil。
-	Result *relayconvert.RequestResult
+
+	report      Report
+	diagnostics []Diagnostic
 }
 
-// Diagnostics 返回请求转换产生的诊断。
-func (p *Prepared) Diagnostics() []types.ConversionDiagnostic {
-	if p == nil || p.Result == nil {
+// Report 说明这次转换是怎么完成的。Passthrough 为真时返回零值。
+func (p *Prepared) Report() Report {
+	if p == nil {
+		return Report{}
+	}
+	return p.report
+}
+
+// Diagnostics 返回请求转换产生的诊断。Passthrough 为真时返回空。
+func (p *Prepared) Diagnostics() []Diagnostic {
+	if p == nil {
 		return nil
 	}
-	return p.Result.Diagnostics
+	return p.diagnostics
 }
 
 // Request 描述一次待转换的请求。
@@ -148,16 +159,16 @@ func (e *Engine) PrepareRequest(ctx context.Context, req Request) (*Prepared, er
 	if upstreamModel == "" {
 		upstreamModel = req.OriginModel
 	}
-	baseModel, state := e.ParseModel(req.OriginModel)
+	baseModel, parsed := e.ParseModel(req.OriginModel)
 	meta := &convmeta.Values{
 		OriginModelName:     baseModel,
 		UpstreamModelName:   upstreamModel,
 		ChannelMetaAttached: true,
 		IsStream:            stream,
-		ReasoningConversion: state,
+		ReasoningConversion: reasoningStateOf(parsed),
 		Options:             &e.options,
 	}
-	result, err := relayconvert.ConvertRequest(ctx, meta, req.To.RelayFormat(), request)
+	result, err := relayconvert.ConvertRequest(ctx, meta, relayFormatOf(req.To), request)
 	if err != nil {
 		return nil, fmt.Errorf("relay: %s 转 %s 请求失败: %w", req.From, req.To, err)
 	}
@@ -165,7 +176,12 @@ func (e *Engine) PrepareRequest(ctx context.Context, req Request) (*Prepared, er
 	if err != nil {
 		return nil, err
 	}
-	return &Prepared{Body: encoded, Stream: stream, Result: result}, nil
+	return &Prepared{
+		Body:        encoded,
+		Stream:      stream,
+		report:      reportOfRequest(result),
+		diagnostics: requestDiagnostics(result),
+	}, nil
 }
 
 // PreparedResponse 是转换后的非流式响应。
@@ -175,9 +191,29 @@ type PreparedResponse struct {
 	// Body 是发给客户端的响应体。
 	Body []byte
 	// Usage 是归一后的用量，可能为 nil。
+	//
+	// 这个字段用的是 RelayKit 的类型，理由见 docs/relay.md 的
+	// 「与 RelayKit 的关系」：镜像用量结构只会带来漂移。
 	Usage *dto.Usage
-	// Diagnostics 是转换损耗。
-	Diagnostics []types.ConversionDiagnostic
+
+	report      Report
+	diagnostics []Diagnostic
+}
+
+// Report 说明这次转换是怎么完成的。Passthrough 为真时返回零值。
+func (p *PreparedResponse) Report() Report {
+	if p == nil {
+		return Report{}
+	}
+	return p.report
+}
+
+// Diagnostics 返回响应转换产生的诊断。Passthrough 为真时返回空。
+func (p *PreparedResponse) Diagnostics() []Diagnostic {
+	if p == nil {
+		return nil
+	}
+	return p.diagnostics
 }
 
 // Response 描述一次待转换的非流式响应。From 是渠道方言，To 是客户端方言。
@@ -199,7 +235,7 @@ func (e *Engine) PrepareResponse(ctx context.Context, resp Response) (*PreparedR
 		return nil, err
 	}
 	meta := e.responseMeta(resp.OriginModel, resp.UpstreamModel)
-	result, err := relayconvert.ConvertResponse(ctx, meta, resp.To.RelayFormat(), response)
+	result, err := relayconvert.ConvertResponse(ctx, meta, relayFormatOf(resp.To), response)
 	if err != nil {
 		return nil, fmt.Errorf("relay: %s 转 %s 响应失败: %w", resp.From, resp.To, err)
 	}
@@ -207,7 +243,12 @@ func (e *Engine) PrepareResponse(ctx context.Context, resp Response) (*PreparedR
 	if err != nil {
 		return nil, err
 	}
-	return &PreparedResponse{Body: encoded, Usage: result.Usage, Diagnostics: result.Diagnostics}, nil
+	return &PreparedResponse{
+		Body:        encoded,
+		Usage:       result.Usage,
+		report:      reportOfResponse(result),
+		diagnostics: responseDiagnostics(result),
+	}, nil
 }
 
 // responseMeta 构造响应阶段的转换上下文。推理状态在响应阶段不参与判断，

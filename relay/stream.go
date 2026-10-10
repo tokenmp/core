@@ -7,7 +7,6 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert/convmeta"
-	"github.com/QuantumNous/new-api/relaykit/types"
 
 	"github.com/tokenmp/core/dialect"
 )
@@ -44,8 +43,8 @@ func (e *Engine) NewStream(from, to dialect.Name, originModel, upstreamModel str
 		return nil, ErrSameDialect
 	}
 	state, err := relayconvert.NewResponseStreamState(
-		from.RelayFormat(),
-		to.RelayFormat(),
+		relayFormatOf(from),
+		relayFormatOf(to),
 		relayconvert.ResponseStreamOptions{
 			ID:                 opts.ID,
 			Model:              opts.Model,
@@ -111,13 +110,29 @@ func (s *Stream) Fail(code, message, param string) ([]dialect.StreamEvent, bool)
 }
 
 // Usage 返回会话累计的用量，可能为 nil。
+//
+// 这个返回值的类型来自 RelayKit，理由见 docs/relay.md 的「与 RelayKit 的关系」。
 func (s *Stream) Usage() *dto.Usage {
 	return s.state.Usage()
 }
 
+// Report 说明这次转换是怎么完成的。
+func (s *Stream) Report() Report {
+	if s == nil {
+		return Report{}
+	}
+	return Report{
+		Converter: s.state.Converter,
+		Quality:   Quality(s.state.Quality),
+		Steps:     responseSteps(s.state.Steps),
+		From:      dialectOf(s.state.From),
+		To:        dialectOf(s.state.To),
+	}
+}
+
 // Diagnostics 返回会话累计的转换损耗。
-func (s *Stream) Diagnostics() []types.ConversionDiagnostic {
-	return s.state.Diagnostics()
+func (s *Stream) Diagnostics() []Diagnostic {
+	return diagnostics(s.state.Diagnostics())
 }
 
 // encode 把转换结果编成可写出的流式事件。
