@@ -1,5 +1,8 @@
-# core 的示例配置：一个渠道、一条模型规则、一个插件。
+# core 的示例配置：两个渠道、一组模型规则、一个插件。
 # 复制出去改成自己的渠道即可，凭据只写环境变量名。
+#
+# 两个渠道指向同一个服务只是为了能直接跑起来。真实场景里它们应当是两家不同账号，
+# 这样 models 里的 affinity 才有意义：同一个账号的两把 key 本来就共享提示缓存。
 
 listen: 127.0.0.1:8787
 
@@ -18,11 +21,23 @@ channels:
       key_env: OPENROUTER_API_KEY
     timeout: 120s
 
+  # 第二个账号。没有配 auth，因此指向本地假上游时可以直接跑。
+  - name: backup
+    dialect: openai
+    base_url: https://openrouter.ai/api/v1
+    path: /chat/completions
+
 models:
   - match: "gpt-*"
     channel: openrouter
+  # 组名相同的规则组成一个池。带上会话标识的请求会在池内粘住一条渠道，让上游的
+  # 提示缓存有机会命中。两条都写同一个组名，它们才构成可互换的候选。
   - match: "claude-*"
     channel: openrouter
+    affinity: accounts
+  - match: "claude-*"
+    channel: backup
+    affinity: accounts
 
 plugins:
   dir: plugins
