@@ -27,31 +27,33 @@ func (s *Server) forward(writer http.ResponseWriter, request *http.Request, clie
 	}
 
 	if _, err := dialect.DecodeRequest(client, body); err != nil {
-		s.writeError(writer, http.StatusBadRequest, "invalid_request", err.Error())
+		s.writeError(ctx, writer, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	stream, err := dialect.StreamIntent(client, body, streamHint)
 	if err != nil {
-		s.writeError(writer, http.StatusBadRequest, "invalid_request", err.Error())
+		s.writeError(ctx, writer, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	model := pathModel
 	if model == "" {
 		model, err = dialect.ModelOf(client, body)
 		if err != nil {
-			s.writeError(writer, http.StatusBadRequest, "invalid_request", err.Error())
+			s.writeError(ctx, writer, http.StatusBadRequest, "invalid_request", err.Error())
 			return
 		}
 	}
 
 	body, model = s.rewriteRequest(ctx, client, model, stream, body)
+	// 插件可能改过模型名，记录以改写后的为准。
+	accessOf(ctx).setModel(model)
 	routes, rejected := usableRoutes(s.config.Resolve(model))
 	if len(routes) == 0 {
 		if rejected != "" {
-			s.writeError(writer, http.StatusBadRequest, "invalid_model", rejected)
+			s.writeError(ctx, writer, http.StatusBadRequest, "invalid_model", rejected)
 			return
 		}
-		s.writeError(writer, http.StatusNotFound, "model_not_found",
+		s.writeError(ctx, writer, http.StatusNotFound, "model_not_found",
 			fmt.Sprintf("没有匹配模型 %s 的路由", model))
 		return
 	}
@@ -128,7 +130,7 @@ func (s *Server) callUpstream(
 		})
 		if err != nil {
 			lastMessage = err.Error()
-			s.logger.Warn("请求转换失败", "route", routeOf(route), "error", err.Error())
+			s.logger.Warn("请求转换失败", "request_id", requestIDOf(ctx), "route", routeOf(route), "error", err.Error())
 			continue
 		}
 		response, err := upstream.Send(ctx, channel.Request{
@@ -139,30 +141,35 @@ func (s *Server) callUpstream(
 		})
 		if err != nil {
 			lastMessage = err.Error()
-			s.logger.Warn("上游请求失败", "route", routeOf(route), "error", err.Error())
+			s.logger.Warn("上游请求失败", "request_id", requestIDOf(ctx), "route", routeOf(route), "error", err.Error())
 			continue
 		}
 		if response.StatusCode >= http.StatusBadRequest {
 			if shouldTryNext(response.StatusCode, index, len(routes)) {
 				lastMessage = readErrorBody(response)
-				s.logger.Warn("上游拒绝请求，改试下一条路由", "route", routeOf(route), "status", response.StatusCode)
+				s.logger.Warn("上游拒绝请求，改试下一条路由", "request_id", requestIDOf(ctx), "route", routeOf(route), "status", response.StatusCode)
 				continue
 			}
 			// 不可重试的状态，或已经是最后一条候选：原样交给调用方。
+			accessOf(ctx).served(route.Channel, index+1)
 			return response, prepared, route
 		}
 		if len(prepared.Diagnostics()) > 0 {
 			s.logger.Debug("转换损耗",
+				"request_id", requestIDOf(ctx),
 				"route", routeOf(route),
 				"count", len(prepared.Diagnostics()),
 				"diagnostics", prepared.Diagnostics())
 		}
+		accessOf(ctx).served(route.Channel, index+1)
 		return response, prepared, route
 	}
 	if lastMessage == "" {
 		lastMessage = "没有可用的候选路由"
 	}
-	s.writeError(writer, http.StatusBadGateway, "upstream_error", lastMessage)
+	// 候选全部试过：记下试了几条，渠道留空表示没有一条服务成功。
+	accessOf(ctx).served("", len(routes))
+	s.writeError(ctx, writer, http.StatusBadGateway, "upstream_error", lastMessage)
 	return nil, nil, config.Route{}
 }
 
@@ -181,7 +188,7 @@ func (s *Server) writeUpstream(
 		// 错误响应按原样透传：不同上游的错误形状差异很大，翻译只会丢掉排查线索。
 		writer.WriteHeader(response.StatusCode)
 		if _, err := io.Copy(writer, io.LimitReader(response.Body, s.maxBodyBytes)); err != nil {
-			s.logger.Warn("写出上游错误响应失败", "error", err.Error())
+			s.logger.Warn("写出上游错误响应失败", "request_id", requestIDOf(request.Context()), "error", err.Error())
 		}
 		return
 	}
@@ -204,7 +211,7 @@ func (s *Server) writeBuffered(
 ) {
 	body, err := io.ReadAll(io.LimitReader(response.Body, s.maxBodyBytes))
 	if err != nil {
-		s.writeError(writer, http.StatusBadGateway, "upstream_error", fmt.Sprintf("读取上游响应失败: %v", err))
+		s.writeError(request.Context(), writer, http.StatusBadGateway, "upstream_error", fmt.Sprintf("读取上游响应失败: %v", err))
 		return
 	}
 	converted, err := s.engine.PrepareResponse(request.Context(), relay.Response{
@@ -215,8 +222,8 @@ func (s *Server) writeBuffered(
 		UpstreamModel: route.Upstream,
 	})
 	if err != nil {
-		s.logger.Warn("响应转换失败", "error", err.Error())
-		s.writeError(writer, http.StatusBadGateway, "conversion_error", err.Error())
+		s.logger.Warn("响应转换失败", "request_id", requestIDOf(request.Context()), "error", err.Error())
+		s.writeError(request.Context(), writer, http.StatusBadGateway, "conversion_error", err.Error())
 		return
 	}
 	out := converted.Body
@@ -226,11 +233,10 @@ func (s *Server) writeBuffered(
 	}
 	writer.WriteHeader(http.StatusOK)
 	if _, err := writer.Write(out); err != nil {
-		s.logger.Warn("写出响应失败", "error", err.Error())
+		s.logger.Warn("写出响应失败", "request_id", requestIDOf(request.Context()), "error", err.Error())
 	}
-	if converted.Usage != nil {
-		s.logger.Debug("请求完成", "model", model, "usage", converted.Usage)
-	}
+	// 用量交给访问日志那一行，这里不再单独记一条。
+	accessOf(request.Context()).recordUsage(converted.Usage)
 }
 
 // rewriteRequest 依次调用启用插件的请求钩子。没有插件参与时不动原始字节。
@@ -245,7 +251,7 @@ func (s *Server) rewriteRequest(ctx context.Context, client dialect.Name, model 
 		Body:    json.RawMessage(body),
 	})
 	if err != nil {
-		s.logger.Warn("构造请求钩子负载失败", "error", err.Error())
+		s.logger.Warn("构造请求钩子负载失败", "request_id", requestIDOf(ctx), "error", err.Error())
 		return body, model
 	}
 	outcome := s.plugins.Apply(ctx, plugin.HookRequest, payload, mergeRequest, nil, s.session())
@@ -254,7 +260,7 @@ func (s *Server) rewriteRequest(ctx context.Context, client dialect.Name, model 
 	}
 	var final requestPayload
 	if err := json.Unmarshal(outcome.Data, &final); err != nil {
-		s.logger.Warn("解析请求钩子输出失败", "plugins", outcome.Applied, "error", err.Error())
+		s.logger.Warn("解析请求钩子输出失败", "request_id", requestIDOf(ctx), "plugins", outcome.Applied, "error", err.Error())
 		return body, model
 	}
 	updated := body
@@ -264,7 +270,7 @@ func (s *Server) rewriteRequest(ctx context.Context, client dialect.Name, model 
 	if final.Model != "" {
 		model = final.Model
 	}
-	s.logger.Debug("请求钩子生效", "plugins", outcome.Applied, "model", model)
+	s.logger.Debug("请求钩子生效", "request_id", requestIDOf(ctx), "plugins", outcome.Applied, "model", model)
 	return updated, model
 }
 
@@ -279,7 +285,7 @@ func (s *Server) rewriteResponse(ctx context.Context, client dialect.Name, model
 		Body:    json.RawMessage(body),
 	})
 	if err != nil {
-		s.logger.Warn("构造响应钩子负载失败", "error", err.Error())
+		s.logger.Warn("构造响应钩子负载失败", "request_id", requestIDOf(ctx), "error", err.Error())
 		return body
 	}
 	outcome := s.plugins.Apply(ctx, plugin.HookResponse, payload, mergeResponse, nil, s.session())
@@ -288,13 +294,13 @@ func (s *Server) rewriteResponse(ctx context.Context, client dialect.Name, model
 	}
 	var final responsePayload
 	if err := json.Unmarshal(outcome.Data, &final); err != nil {
-		s.logger.Warn("解析响应钩子输出失败", "plugins", outcome.Applied, "error", err.Error())
+		s.logger.Warn("解析响应钩子输出失败", "request_id", requestIDOf(ctx), "plugins", outcome.Applied, "error", err.Error())
 		return body
 	}
 	if len(final.Body) == 0 {
 		return body
 	}
-	s.logger.Debug("响应钩子生效", "plugins", outcome.Applied)
+	s.logger.Debug("响应钩子生效", "request_id", requestIDOf(ctx), "plugins", outcome.Applied)
 	return final.Body
 }
 
