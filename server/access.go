@@ -137,10 +137,10 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 // 转发路径只在请求结束时写日志，请求进来之后、结束之前本来没有痕迹。流式响应可能
 // 持续几分钟，这期间日志里看不出请求正在跑；请求卡住或进程被杀时，至少还留下这一行。
 //
-// 代价是每个请求多一行，默认级别下日志量翻倍。换到的只有时序：字段是完成行里在进入
-// 时就已经确定的那五个，两行因此可以逐字段对照。user_agent 两行都写，多出来的那一份
-// 换的是：请求没跑完时，进入行是唯一能看到客户端的地方。会话标识在进入时也已经知道，
-// 但访问日志的两行都不带它；要不要把它收进字段集是另一个决定。
+// 代价是每个请求多一行。两行各管一半：进入行回答「是谁在调用」，给的是 client 与
+// user_agent；完成行回答「结果是什么」，给的是 status、duration、model、channel 与
+// attempts。method、path 与 request_id 两行都有，用来把同一次请求认出来。进入行必定
+// 写出（在处理器之前，panic 路径也写出），所以完成行不再重复客户端标识。
 //
 // 记 INFO 而不是 DEBUG。进入时还不知道结果，没有状态码可以分级；而默认的 log.level
 // 是 info，把进入行记成 DEBUG 等于默认看不见，上面那点可见性就拿不到。
@@ -173,8 +173,6 @@ func (s *Server) logAccess(record *accessRecord) {
 		"model", record.model,
 		"channel", record.channel,
 		"attempts", record.attempts,
-		"client", record.client,
-		"user_agent", record.userAgent,
 	}
 	if record.hasUsage {
 		attrs = append(attrs,

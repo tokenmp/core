@@ -121,6 +121,8 @@ Gemini 的路径含模型名，不支持覆盖。
 
 进入行在请求进入路由之前写出，恒记 INFO，字段是
 `request_id`、`method`、`path`、`client`、`user_agent`。
+`client` 是去掉端口之后的客户端地址，`user_agent` 是请求头里的 `User-Agent`；
+这两个字段只有进入行有，完成行不再重复。
 
 完成行在处理器返回之后写出。级别口径按状态码定，默认的 `log.level` 是 `info`。
 状态码小于 400 记 INFO，因此服务一跑起来就能看见每个请求，
@@ -131,11 +133,9 @@ Gemini 的路径含模型名，不支持覆盖。
 一次请求的几条日志靠它串起来。
 
 完成行的字段有 `request_id`、`method`、`path`、`status`、`duration`、
-`model`、`channel`、`attempts`、`client`、`user_agent`。跨方言转发且上游
-给出用量时另有 `prompt_tokens`、`completion_tokens`、`total_tokens`，
-有缓存命中时加 `cached_tokens`；同方言透传不解析用量，这一行也就没有 token 字段。
-
-`client` 是去掉端口之后的客户端地址，`user_agent` 是请求头里的 `User-Agent`。
+`model`、`channel`、`attempts`。跨方言转发且上游给出用量时另有
+`prompt_tokens`、`completion_tokens`、`total_tokens`，有缓存命中时加
+`cached_tokens`；同方言透传不解析用量，这一行也就没有 token 字段。
 
 `method`、`path`、`user_agent` 与 `model` 的值来自请求，超过 256 字节时截断，
 末尾的省略号算在这 256 字节之内。`attempts` 是这条请求试过的候选条数，
