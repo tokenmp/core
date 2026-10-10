@@ -144,7 +144,9 @@ Gemini 的路径含模型名，不支持覆盖。
 `duration` 是 slog 的时长属性：`text` 格式下形如 `12.3ms`，`json` 下是纳秒整数。
 
 宿主要在每次请求结束时记自己的指标，用 `server.WithRequestDone` 拿原始量，
-不必解析这两行。见 [README](https://github.com/tokenmp/core#readme)。
+不必解析这两行。要整个接管记录就用 `Options.Middleware` 与
+`Options.DisableAccessLog`，两者都见
+[README](https://github.com/tokenmp/core#readme)。
 
 ## 校验
 

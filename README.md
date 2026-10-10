@@ -89,6 +89,38 @@ service, err := server.FromConfigWith(cfg, logger, server.WithRequestDone(func(o
 - 回调同步跑在请求的 goroutine 上，宿主在里面做的耗时工作会算进客户端等待时间里。
   它 panic 会被吞掉并记一行 ERROR，不连累别的请求。
 
+宿主想自己接管记录，用 `WithMiddleware` 包住内核的处理器：
+
+```go
+service, err := server.FromConfigWith(cfg, logger, server.WithoutAccessLog(),
+    server.WithMiddleware(func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            next.ServeHTTP(w, r)
+            // 内核的内部数据在这里已经填好，不必去解析日志。
+            if outcome, ok := server.OutcomeFromContext(r.Context()); ok {
+                logger.Info("请求结束",
+                    "request_id", outcome.RequestID,
+                    "channel", outcome.Channel,
+                    "ttft", outcome.FirstByte,
+                    "attempts", len(outcome.Attempts))
+            }
+        })
+    }))
+```
+
+中间件装在内核访问日志的**内侧**，它拿到的 context 里已经有本次请求的访问记录，
+所以 `OutcomeFromContext` 在 `next` 返回之后能读到渠道、每次尝试、用量与首字节时间。
+`WithoutAccessLog()` 关掉内核自己那两行，避免与宿主的记录重复；关掉之后进入行里的
+`client` 与 `user_agent` 也一起没有，需要的话从 `Outcome` 的同名字段自己记。
+
+两个边界要知道：
+
+- 包装 `http.ResponseWriter` 时必须把 `Flush` 转发下去，
+  否则流式响应会静默退化成不刷新。
+- `OutcomeFromContext` 只能在本次请求的 goroutine 上调用：它读的那条记录不加锁。
+- 改请求头不会传到上游 —— 上游请求头来自渠道配置，内核不从进来的请求里抄。
+  请求体可以换：内核从 `request.Body` 读，换过之后参与路由的就是新内容。
+
 只用转换内核、不起服务也是支持的：
 
 ```go

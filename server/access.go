@@ -52,6 +52,9 @@ type accessRecord struct {
 	// tries 按顺序记下每条候选的尝试，访问日志的 attempts 与交回宿主的
 	// Outcome.Attempts 都是它，两个出口因此不会对不上。
 	tries []Attempt
+	// now 与 Server 用同一个时间源。放在记录上是为了让 OutcomeFromContext
+	// 这个包级函数也能算出「到现在为止」的时长。
+	now func() time.Time
 }
 
 // accessRecordKey 是记录在 context 里的键。用私有类型避免与别的包撞键。
@@ -147,6 +150,7 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 			// started 取在写进入行之前。duration 记的是客户端等待的时长，日志 sink 慢
 			// 带来的拖延也一样拖了客户端，不该从这段时长里排除掉。
 			started: s.now(),
+			now:     s.now,
 		}
 		s.logArrival(record)
 		tracked := &accessWriter{ResponseWriter: writer, record: record, now: s.now}
@@ -180,6 +184,9 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 // 记 INFO 而不是 DEBUG。进入时还不知道结果，没有状态码可以分级；而默认的 log.level
 // 是 info，把进入行记成 DEBUG 等于默认看不见，上面那点可见性就拿不到。
 func (s *Server) logArrival(record *accessRecord) {
+	if s.disableAccessLog {
+		return
+	}
 	s.logger.Info("请求进入",
 		"request_id", record.requestID,
 		"method", record.method,
@@ -194,6 +201,9 @@ func (s *Server) logArrival(record *accessRecord) {
 // 因此服务只要在跑就能看见每个请求，包括同方言透传这条最常见的路径；失败请求
 // 与既有的 WARN 行同级，一起由 log.level 控制。
 func (s *Server) logAccess(record *accessRecord, finished time.Time) {
+	if s.disableAccessLog {
+		return
+	}
 	status := effectiveStatus(record)
 	attrs := []any{
 		"request_id", record.requestID,
@@ -258,34 +268,39 @@ func (s *Server) notify(record *accessRecord, finished time.Time) {
 				"error", fmt.Sprint(recovered))
 		}
 	}()
-	s.onRequestDone(s.outcomeOf(record, finished))
+	s.onRequestDone(record.outcome(finished.Sub(record.started)))
 }
 
-// outcomeOf 把访问记录整理成交给宿主的原始量。
-func (s *Server) outcomeOf(record *accessRecord, finished time.Time) Outcome {
+// outcome 把访问记录整理成交给宿主的原始量。
+//
+// duration 由调用方给：内核收尾时给按采好的结束时刻算出的值，宿主从 context 读时
+// 给按当时时刻算出的值。
+func (r *accessRecord) outcome(duration time.Duration) Outcome {
 	outcome := Outcome{
-		RequestID:    record.requestID,
-		Method:       record.method,
-		Path:         record.path,
-		Client:       record.client,
-		UserAgent:    record.userAgent,
-		Status:       effectiveStatus(record),
-		Duration:     finished.Sub(record.started),
-		BytesWritten: record.bytesWritten,
-		Model:        record.model,
-		Channel:      record.channel,
-		Streaming:    record.streaming,
-		Attempts:     record.tries,
+		RequestID:    r.requestID,
+		Method:       r.method,
+		Path:         r.path,
+		Client:       r.client,
+		UserAgent:    r.userAgent,
+		Status:       effectiveStatus(r),
+		Duration:     duration,
+		BytesWritten: r.bytesWritten,
+		Model:        r.model,
+		Channel:      r.channel,
+		Streaming:    r.streaming,
+		// 拷一份交出：交出去的是快照，宿主改写自己那份不会污染内核的记录，
+		// 也不会影响同一请求稍后交给 OnRequestDone 的那份。
+		Attempts: append([]Attempt(nil), r.tries...),
 	}
-	if !record.firstByteAt.IsZero() {
-		outcome.FirstByte = record.firstByteAt.Sub(record.started)
+	if !r.firstByteAt.IsZero() {
+		outcome.FirstByte = r.firstByteAt.Sub(r.started)
 	}
-	if record.hasUsage {
+	if r.hasUsage {
 		outcome.Usage = &Usage{
-			PromptTokens:     record.promptTokens,
-			CompletionTokens: record.completionTokens,
-			TotalTokens:      record.totalTokens,
-			CachedTokens:     record.cachedTokens,
+			PromptTokens:     r.promptTokens,
+			CompletionTokens: r.completionTokens,
+			TotalTokens:      r.totalTokens,
+			CachedTokens:     r.cachedTokens,
 		}
 	}
 	return outcome
