@@ -87,4 +87,8 @@ type Usage struct {
 	TotalTokens      int
 	// CachedTokens 是命中提示缓存的那部分提示词 token，上游没报时为 0。
 	CachedTokens int
+	// CacheWriteTokens 是写进提示缓存的那部分提示词 token，上游没报时为 0。
+	// Claude 与 OpenAI 各用一种字段名报这个数，这里交出转换层归一之后的一个值，
+	// 宿主不必再去分辨上游用的是哪一种写法。
+	CacheWriteTokens int
 }

@@ -573,6 +573,81 @@ models:
 	}
 }
 
+// TestAccessLogReportsCacheTokensAcrossDialects 覆盖归一之后的缓存读与缓存写。
+//
+// 转换后的用量不把缓存量放在顶层 prompt_cache_hit_tokens：Claude 目标把它放在
+// input_tokens_details，OpenAI 目标放在 prompt_tokens_details。两个方向各查一次，
+// 完成行与 Outcome 都要拿到这两个数，PromptTokens 则是含了缓存读与缓存写的总数。
+func TestAccessLogReportsCacheTokensAcrossDialects(t *testing.T) {
+	cases := []struct {
+		name           string
+		channelDialect string
+		path           string
+		requestBody    string
+		upstreamBody   string
+	}{
+		{
+			name:           "Claude 客户端 OpenAI 渠道",
+			channelDialect: "openai",
+			path:           "/v1/messages",
+			requestBody:    `{"model":"client-model","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}`,
+			upstreamBody: `{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"upstream-model",` +
+				`"choices":[{"index":0,"message":{"role":"assistant","content":"你好"},"finish_reason":"stop"}],` +
+				`"usage":{"prompt_tokens":1768,"completion_tokens":2,"total_tokens":1770,` +
+				`"prompt_tokens_details":{"cached_tokens":640,"cache_write_tokens":128}}}`,
+		},
+		{
+			name:           "OpenAI 客户端 Claude 渠道",
+			channelDialect: "claude",
+			path:           "/v1/chat/completions",
+			requestBody:    `{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`,
+			upstreamBody: `{"id":"msg_1","type":"message","role":"assistant","model":"upstream-model",` +
+				`"content":[{"type":"text","text":"你好"}],"stop_reason":"end_turn",` +
+				`"usage":{"input_tokens":1000,"output_tokens":2,"cache_read_input_tokens":640,"cache_creation_input_tokens":128}}`,
+		},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+				writeJSON(writer, http.StatusOK, testCase.upstreamBody)
+			})
+			front, logs, outcomes := newSeamServer(t, `
+channels:
+  - {name: upstream, dialect: `+testCase.channelDialect+`, base_url: "`+upstreamServer.URL+`"}
+models:
+  - {match: "client-model", channel: upstream}
+`)
+
+			status, _, body := post(t, front.URL+testCase.path, testCase.requestBody)
+			if status != http.StatusOK {
+				t.Fatalf("状态码不符: %d %s", status, body)
+			}
+			line := onlyLine(t, waitForLog(t, logs, "请求完成", 1), "请求完成")
+			// 分母含缓存读与缓存写：1768 = 1000 + 640 + 128。
+			if got := numberField(t, line, "prompt_tokens"); got != 1768 {
+				t.Fatalf("prompt_tokens 不符: %v（完成行 %v）", got, line)
+			}
+			if got := numberField(t, line, "cached_tokens"); got != 640 {
+				t.Fatalf("cached_tokens 不符: %v（完成行 %v）", got, line)
+			}
+			if got := numberField(t, line, "cache_write_tokens"); got != 128 {
+				t.Fatalf("cache_write_tokens 不符: %v（完成行 %v）", got, line)
+			}
+
+			outcome := outcomes.wait(t, 1)[0]
+			if outcome.Usage == nil {
+				t.Fatalf("Outcome.Usage 不该是 nil: %+v", outcome)
+			}
+			if outcome.Usage.PromptTokens != 1768 {
+				t.Fatalf("Outcome.Usage.PromptTokens 不符: %+v", outcome.Usage)
+			}
+			if outcome.Usage.CachedTokens != 640 || outcome.Usage.CacheWriteTokens != 128 {
+				t.Fatalf("Outcome.Usage 缓存量不符: %+v", outcome.Usage)
+			}
+		})
+	}
+}
+
 // TestAccessLogCountsAttempts 覆盖重试：降级换过渠道之后，完成行记下实际服务的
 // 渠道与尝试过的候选条数。
 func TestAccessLogCountsAttempts(t *testing.T) {
@@ -630,5 +705,38 @@ models:
 	done := lineWith(t, lines, "msg", "请求完成")
 	if stringField(t, interrupted, "request_id") != stringField(t, done, "request_id") {
 		t.Fatalf("中断行与完成行的 request_id 不同: %v / %v", interrupted, done)
+	}
+}
+
+// TestAccessLogReportsTopLevelCacheHit 覆盖只把缓存读报在顶层 prompt_cache_hit_tokens
+// 的上游（DeepSeek 那类写法），details 为空。这一处与跨方言的两个 details 字段是同一个
+// 概念，宿主看到的命中率不该因为上游换了一种写法就变成 0。
+func TestAccessLogReportsTopLevelCacheHit(t *testing.T) {
+	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, `{"id":"chatcmpl-1","object":"chat.completion","created":1,`+
+			`"model":"upstream-model",`+
+			`"choices":[{"index":0,"message":{"role":"assistant","content":"你好"},"finish_reason":"stop"}],`+
+			`"usage":{"prompt_tokens":1768,"completion_tokens":2,"total_tokens":1770,`+
+			`"prompt_cache_hit_tokens":640}}`)
+	})
+	front, logs, outcomes := newSeamServer(t, `
+channels:
+  - {name: upstream, dialect: openai, base_url: "`+upstreamServer.URL+`"}
+models:
+  - {match: "client-model", channel: upstream}
+`)
+
+	status, _, body := post(t, front.URL+"/v1/messages",
+		`{"model":"client-model","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}`)
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d %s", status, body)
+	}
+	line := onlyLine(t, waitForLog(t, logs, "请求完成", 1), "请求完成")
+	if got := numberField(t, line, "cached_tokens"); got != 640 {
+		t.Fatalf("只报顶层 prompt_cache_hit_tokens 时 cached_tokens 不符: %v（完成行 %v）", got, line)
+	}
+	outcome := outcomes.wait(t, 1)[0]
+	if outcome.Usage == nil || outcome.Usage.CachedTokens != 640 {
+		t.Fatalf("只报顶层 prompt_cache_hit_tokens 时 Outcome 缓存读不符: %+v", outcome.Usage)
 	}
 }

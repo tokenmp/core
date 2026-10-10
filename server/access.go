@@ -44,6 +44,9 @@ type accessRecord struct {
 	completionTokens int
 	totalTokens      int
 	cachedTokens     int
+	// cacheWriteTokens 是写进提示缓存的 token 数。Claude 与 OpenAI 各用一种字段名
+	// 报这个数，转换层已经归一成一个，这里不再区分。
+	cacheWriteTokens int
 	// firstByteAt 与 bytesWritten 只有包装层知道，事后再采就晚了，因此在请求路径上采集；
 	// 它们与 streaming 都只给交回宿主的 Outcome 用。
 	firstByteAt  time.Time
@@ -128,7 +131,52 @@ func (r *accessRecord) recordUsage(usage *dto.Usage) {
 	r.promptTokens = usage.PromptTokens
 	r.completionTokens = usage.CompletionTokens
 	r.totalTokens = usage.TotalTokens
-	r.cachedTokens = usage.PromptCacheHitTokens
+	r.cachedTokens = cachedTokensOf(usage)
+	r.cacheWriteTokens = cacheWriteTokensOf(usage)
+}
+
+// canonicalUsageOf 取归一之后的用量。
+//
+// 缓存读可能报在顶层 prompt_cache_hit_tokens（DeepSeek 那类写法），也可能报在
+// prompt_tokens_details 或 input_tokens_details 里。BillingUsage 是 RelayKit 保留的
+// 原始用量快照，CanonicalUsage 把前一种写法搬进 details，因此有快照就用它归一的
+// 结果；直接读扁平字段会让前一种上游的缓存量恒为 0。快照缺失或不认识时退回原值。
+func canonicalUsageOf(usage *dto.Usage) *dto.Usage {
+	if usage.BillingUsage == nil {
+		return usage
+	}
+	if canonical, ok := usage.BillingUsage.CanonicalUsage(); ok && canonical != nil {
+		return canonical
+	}
+	return usage
+}
+
+// cachedTokensOf 取归一之后的缓存读量。
+//
+// 两个 details 都有值时取较大者，与缓存写的合并口径一致；负值归零，避免拉低
+// 宿主算的命中率。
+func cachedTokensOf(usage *dto.Usage) int {
+	canonical := canonicalUsageOf(usage)
+	fromPrompt := canonical.PromptTokensDetails.CachedTokens
+	fromInput := 0
+	if canonical.InputTokensDetails != nil {
+		fromInput = canonical.InputTokensDetails.CachedTokens
+	}
+	return max(fromPrompt, fromInput, 0)
+}
+
+// cacheWriteTokensOf 取归一之后的缓存写量。
+//
+// Claude 的 cached_creation_tokens 与 OpenAI 的 cache_write_tokens 由 RelayKit 的
+// CacheCreationTokensTotal 合并取较大者并把负值归零，这里不重复实现。两个 details
+// 都有值时同样取较大者，避免同一批 token 被算两次。
+func cacheWriteTokensOf(usage *dto.Usage) int {
+	canonical := canonicalUsageOf(usage)
+	total := canonical.PromptTokensDetails.CacheCreationTokensTotal()
+	if canonical.InputTokensDetails != nil {
+		total = max(total, canonical.InputTokensDetails.CacheCreationTokensTotal())
+	}
+	return total
 }
 
 // withAccessLog 包住路由表，给每个请求记两行访问日志（进入与完成），并让这次请求
@@ -219,6 +267,9 @@ func (s *Server) logAccess(record *accessRecord, finished time.Time) {
 		if record.cachedTokens > 0 {
 			attrs = append(attrs, "cached_tokens", record.cachedTokens)
 		}
+		if record.cacheWriteTokens > 0 {
+			attrs = append(attrs, "cache_write_tokens", record.cacheWriteTokens)
+		}
 	}
 	if status < http.StatusBadRequest {
 		s.logger.Info("请求完成", attrs...)
@@ -294,6 +345,7 @@ func (r *accessRecord) outcome(duration time.Duration) Outcome {
 			CompletionTokens: r.completionTokens,
 			TotalTokens:      r.totalTokens,
 			CachedTokens:     r.cachedTokens,
+			CacheWriteTokens: r.cacheWriteTokens,
 		}
 	}
 	return outcome
