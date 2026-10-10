@@ -125,6 +125,21 @@ func onlyLine(t *testing.T, lines []map[string]any, msg string) map[string]any {
 	return found[0]
 }
 
+// completedLines 只留完成行。
+//
+// 进入行与完成行的 path、method、client 完全相同，按这些字段取行之前必须先滤掉
+// 进入行，否则会取到没有 status 的进入行。
+func completedLines(t *testing.T, lines []map[string]any) []map[string]any {
+	t.Helper()
+	var found []map[string]any
+	for _, line := range lines {
+		if line["msg"] == "请求完成" {
+			found = append(found, line)
+		}
+	}
+	return found
+}
+
 func stringField(t *testing.T, line map[string]any, key string) string {
 	t.Helper()
 	value, ok := line[key].(string)
@@ -214,7 +229,7 @@ models:
 	}
 	_ = response.Body.Close()
 
-	lines := waitForLog(t, logs, "请求完成", 3)
+	lines := completedLines(t, waitForLog(t, logs, "请求完成", 3))
 	health := lineWith(t, lines, "path", "/healthz")
 	assertField(t, health, "level", "INFO")
 	assertField(t, health, "method", "GET")
@@ -229,6 +244,40 @@ models:
 	assertField(t, unknown, "level", "WARN")
 	if got := numberField(t, unknown, "status"); got != http.StatusNotFound {
 		t.Fatalf("未知路径状态码不符: %v", got)
+	}
+}
+
+// TestAccessLogForRequestArrival 覆盖请求进入的那一行。
+//
+// 进入行只带进入时确实知道的字段：model 与 channel 要等路由，status、duration 与
+// attempts 要等响应，这些留在完成行里。两行靠 request_id 串起来。
+func TestAccessLogForRequestArrival(t *testing.T) {
+	front, logs := newLoggingServer(t, `
+channels:
+  - {name: upstream, dialect: openai, base_url: "https://example.com"}
+models:
+  - {match: "client-model", channel: upstream}
+`)
+	response, err := get(t, front.URL+"/healthz")
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	_ = response.Body.Close()
+
+	lines := waitForLog(t, logs, "请求完成", 1)
+	arrived := onlyLine(t, lines, "请求进入")
+	assertField(t, arrived, "level", "INFO")
+	assertField(t, arrived, "method", "GET")
+	assertField(t, arrived, "path", "/healthz")
+	assertField(t, arrived, "client", "127.0.0.1")
+	for _, absent := range []string{"status", "duration", "model", "channel", "attempts"} {
+		if _, ok := arrived[absent]; ok {
+			t.Fatalf("进入行不该带 %s 字段，它要等路由或响应才知道: %v", absent, arrived)
+		}
+	}
+	done := onlyLine(t, lines, "请求完成")
+	if stringField(t, arrived, "request_id") != stringField(t, done, "request_id") {
+		t.Fatalf("进入行与完成行的 request_id 不同: %v / %v", arrived, done)
 	}
 }
 
@@ -362,6 +411,9 @@ models:
 	}
 	if first != second {
 		t.Fatalf("WARN 行与完成行的 request_id 不同: %q / %q", first, second)
+	}
+	if got := stringField(t, onlyLine(t, lines, "请求进入"), "request_id"); got != first {
+		t.Fatalf("进入行与 WARN 行的 request_id 不同: %q / %q", got, first)
 	}
 }
 

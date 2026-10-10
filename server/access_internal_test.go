@@ -43,6 +43,49 @@ func TestAccessWriterRecordsImplicitStatus(t *testing.T) {
 	}
 }
 
+// TestAccessMiddlewareLogsArrivalBeforeHandlerReturns 覆盖进入行的时序：处理器还在
+// 跑、请求尚未完成时，进入行就已经写出。
+//
+// 这正是进入行存在的理由——只靠完成行时，流式响应跑的几分钟里日志看不出请求正在跑；
+// 请求卡住或进程被杀时完成行不再出现，至少还留下这一行。
+//
+// 日志缓冲不需要加锁：三次读取都排在 channel 之后，handler goroutine 里对应的写入与
+// 读取之间因此有 happens-before 关系，把锁去掉之后 -race 仍然通过。以后若在未经
+// channel 的位置读它，-race 会把新出现的竞争报出来。
+func TestAccessMiddlewareLogsArrivalBeforeHandlerReturns(t *testing.T) {
+	logs := &bytes.Buffer{}
+	service := &Server{logger: slog.New(slog.NewJSONHandler(logs, nil)), now: time.Now}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	handler := service.withAccessLog(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		close(entered)
+		<-release // 处理器停在这里，请求还没有完成
+		writer.WriteHeader(http.StatusOK)
+	}))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handler.ServeHTTP(httptest.NewRecorder(),
+			httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/slow", nil))
+	}()
+
+	<-entered
+	if text := logs.String(); !strings.Contains(text, `"msg":"请求进入"`) {
+		t.Fatalf("处理器尚未返回时应当已经写出进入行: %s", text)
+	}
+	if text := logs.String(); strings.Contains(text, `"msg":"请求完成"`) {
+		t.Fatalf("处理器尚未返回时不该有完成行: %s", text)
+	}
+
+	close(release)
+	<-done
+	if text := logs.String(); !strings.Contains(text, `"msg":"请求完成"`) {
+		t.Fatalf("处理器返回后应当写出完成行: %s", text)
+	}
+}
+
 // TestAccessMiddlewareLogsPanic 覆盖处理器 panic：这条请求确实失败了，不能按
 // 「没写响应头就是 200」记成成功。
 func TestAccessMiddlewareLogsPanic(t *testing.T) {

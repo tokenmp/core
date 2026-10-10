@@ -88,8 +88,8 @@ func (r *accessRecord) recordUsage(usage *dto.Usage) {
 	r.cachedTokens = usage.PromptCacheHitTokens
 }
 
-// withAccessLog 包住路由表，给每个请求记一行访问日志，并让这次请求的其余日志
-// 带上同一个 request_id。
+// withAccessLog 包住路由表，给每个请求记两行访问日志（进入与完成），并让这次请求
+// 的其余日志带上同一个 request_id。
 //
 // 包在 routes 这一层而不是散在转发路径上：/healthz、/v1/models、未知路径与四种
 // 方言的端点都从同一处经过，宿主用 Handler() 递进来的请求也照样入账。
@@ -100,8 +100,11 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 			method:    request.Method,
 			path:      request.URL.Path,
 			client:    clientAddress(request.RemoteAddr),
-			started:   s.now(),
+			// started 取在写进入行之前。duration 记的是客户端等待的时长，日志 sink 慢
+			// 带来的拖延也一样拖了客户端，不该从这段时长里排除掉。
+			started: s.now(),
 		}
+		s.logArrival(record)
 		tracked := &accessWriter{ResponseWriter: writer, record: record}
 		ctx := context.WithValue(request.Context(), accessRecordKey{}, record)
 		defer func() {
@@ -119,7 +122,28 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 	})
 }
 
-// logAccess 写出访问日志。
+// logArrival 写出请求进入的那一行。
+//
+// 进入行与完成行分开记，是因为两者回答的问题不同。完成行回答「这个请求最后怎么了」；
+// 转发路径只在请求结束时写日志，请求进来之后、结束之前本来没有痕迹。流式响应可能
+// 持续几分钟，这期间日志里看不出请求正在跑；请求卡住或进程被杀时，至少还留下这一行。
+//
+// 代价是每个请求多一行，默认级别下日志量翻倍。换到的只有时序：字段是完成行里在进入
+// 时就已经确定的那四个，两行因此可以逐字段对照。User-Agent 与会话标识在进入时也已经
+// 知道，但访问日志的两行都不带它们；要不要把这两个收进字段集是另一个决定，不该由这
+// 一行顺手定下。
+//
+// 记 INFO 而不是 DEBUG。进入时还不知道结果，没有状态码可以分级；而默认的 log.level
+// 是 info，把进入行记成 DEBUG 等于默认看不见，上面那点可见性就拿不到。
+func (s *Server) logArrival(record *accessRecord) {
+	s.logger.Info("请求进入",
+		"request_id", record.requestID,
+		"method", record.method,
+		"path", record.path,
+		"client", record.client)
+}
+
+// logAccess 写出完成行。
 //
 // 级别口径：状态码小于 400 记 INFO，其余记 WARN。默认的 log.level 是 info，
 // 因此服务只要在跑就能看见每个请求，包括同方言透传这条最常见的路径；失败请求
