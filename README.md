@@ -88,6 +88,7 @@ service, err := server.FromConfigWith(cfg, logger, server.WithRequestDone(func(c
 - `Usage` 只在跨方言转发且上游给出用量时非空。同方言透传按字节转发、不解析，
   流式响应的 TPS 因此算不出来。
 - 回调同步跑在请求的 goroutine 上，宿主在里面做的耗时工作会算进客户端等待时间里。
+  回调返回之后，net/http 会取消这个请求的 context，别在回调里开依赖它的 goroutine。
   它 panic 会被吞掉并记一行 ERROR，不连累别的请求。
 
 宿主想自己接管记录，把 `WithMiddleware` 与 `WithRequestDone` 两个口子都用上：
@@ -120,10 +121,13 @@ service, err := server.FromConfigWith(cfg, logger, server.WithoutAccessLog(),
 `WithoutAccessLog()` 关掉内核自己那两行，避免与宿主的记录重复；关掉之后进入行里的
 `client` 与 `user_agent` 也一起没有，需要的话从 `Outcome` 的同名字段自己记。
 
-两个边界要知道：
+几个边界要知道：
 
 - 包装 `http.ResponseWriter` 时必须把 `Flush` 转发下去，
-  否则流式响应会静默退化成不刷新。
+  否则流式响应会静默退化成不刷新。内核只统计经传给 next 的 writer 写出的字节，
+  宿主在 pre/post 里直接在原 writer 上写、或先设了状态码，不进入 `Outcome`。
+- 中间件不调用 `next` 时内核整个不参与：没有访问日志、没有回调，
+  那条请求由宿主自己记账。
 - 改请求头不会传到上游 —— 上游请求头来自渠道配置，内核不从进来的请求里抄。
   请求体可以换：内核从 `request.Body` 读，换过之后参与路由的就是新内容。
 

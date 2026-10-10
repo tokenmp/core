@@ -191,6 +191,31 @@ func TestMiddlewareCanChangeRequestAndResponse(t *testing.T) {
 	}
 }
 
+// TestMiddlewareSkippingNextSkipsKernel 覆盖外侧布局的结构代价：宿主在中间件里不调 next
+// （例如拒绝请求）时内核整个不参与，没有日志也没有回调，那条请求由宿主自己记账。
+func TestMiddlewareSkippingNextSkipsKernel(t *testing.T) {
+	front, logs, outcomes := newSeamServer(t, seamYAML("https://example.com"), server.WithMiddleware(
+		func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.WriteHeader(http.StatusForbidden)
+			})
+		}))
+
+	status, _, _ := post(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`)
+	if status != http.StatusForbidden {
+		t.Fatalf("宿主拒绝请求时状态码按它写的来: %d", status)
+	}
+	// 回调不该触发。它是同步的，等一小段确认确实没有。
+	time.Sleep(50 * time.Millisecond)
+	if n := len(outcomes.outcomes); n != 0 {
+		t.Fatalf("宿主不调 next 时不该有回调，实际 %d 条", n)
+	}
+	if text := logs.String(); strings.Contains(text, "请求进入") || strings.Contains(text, "请求完成") {
+		t.Fatalf("宿主不调 next 时内核不该写访问日志: %s", text)
+	}
+}
+
 // TestMiddlewareKeepsStreamingFlush 覆盖包装 http.ResponseWriter 时最容易踩的一处：
 // 包装层必须把 Flush 转发下去。这里按推荐写法包一层，流式响应照旧逐片到达。
 func TestMiddlewareKeepsStreamingFlush(t *testing.T) {

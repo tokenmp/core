@@ -267,10 +267,7 @@ func (s *Server) notify(record *accessRecord, finished time.Time, ctx context.Co
 	s.onRequestDone(ctx, record.outcome(finished.Sub(record.started)))
 }
 
-// outcome 把访问记录整理成交给宿主的原始量。
-//
-// duration 由调用方给：内核收尾时给按采好的结束时刻算出的值，宿主从 context 读时
-// 给按当时时刻算出的值。
+// outcome 把访问记录整理成交给宿主的原始量。duration 是调用方采到的结束时刻算出的值。
 func (r *accessRecord) outcome(duration time.Duration) Outcome {
 	outcome := Outcome{
 		RequestID:    r.requestID,
@@ -284,8 +281,8 @@ func (r *accessRecord) outcome(duration time.Duration) Outcome {
 		Model:        r.model,
 		Channel:      r.channel,
 		Streaming:    r.streaming,
-		// 拷一份交出：交出去的是快照，宿主改写自己那份不会污染内核的记录，
-		// 也不会影响同一请求稍后交给 OnRequestDone 的那份。
+		// 拷一份交出：现在每请求只交一次，别留着让后来加第二个出口的人
+		// 踩回别名这个坑。
 		Attempts: append([]Attempt(nil), r.tries...),
 	}
 	if !r.firstByteAt.IsZero() {
