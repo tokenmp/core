@@ -89,7 +89,7 @@ service, err := server.FromConfigWith(cfg, logger, server.WithRequestDone(func(o
 - 回调同步跑在请求的 goroutine 上，宿主在里面做的耗时工作会算进客户端等待时间里。
   它 panic 会被吞掉并记一行 ERROR，不连累别的请求。
 
-宿主想在请求的每个时点自己接管记录，用 `WithMiddleware` 包住内核的处理器：
+宿主想自己接管记录，用 `WithMiddleware` 包住内核的处理器：
 
 ```go
 service, err := server.FromConfigWith(cfg, logger, server.WithoutAccessLog(),
@@ -110,7 +110,8 @@ service, err := server.FromConfigWith(cfg, logger, server.WithoutAccessLog(),
 
 中间件装在内核访问日志的**内侧**，它拿到的 context 里已经有本次请求的访问记录，
 所以 `OutcomeFromContext` 在 `next` 返回之后能读到渠道、每次尝试、用量与首字节时间。
-`WithoutAccessLog()` 关掉内核自己那两行，避免与宿主的记录重复。
+`WithoutAccessLog()` 关掉内核自己那两行，避免与宿主的记录重复；关掉之后进入行里的
+`client` 与 `user_agent` 也一起没有，需要的话从 `Outcome` 的同名字段自己记。
 
 两个边界要知道：
 

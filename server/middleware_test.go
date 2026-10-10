@@ -275,6 +275,43 @@ func TestOutcomeFromContextBeforeNextIsPartial(t *testing.T) {
 	}
 }
 
+// TestOutcomeIsASnapshotNotAlias 覆盖 Outcome 是快照而不是内部数据的别名：宿主改了自己
+// 拿到的那份 Attempts，不该影响同一请求稍后交给 OnRequestDone 的那份。
+//
+// 回调跑在中间件收尾之后，因此中间件要是汄染了内核的记录，这里就能看出来。
+func TestOutcomeIsASnapshotNotAlias(t *testing.T) {
+	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, openAIChatResponse)
+	})
+	front, _, outcomes := newSeamServer(t, seamYAML(upstreamServer.URL), server.WithMiddleware(
+		func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				next.ServeHTTP(writer, request)
+				outcome, ok := server.OutcomeFromContext(request.Context())
+				if !ok || len(outcome.Attempts) == 0 {
+					t.Errorf("中间件里应当读得到尝试列表")
+					return
+				}
+				// 宿主手上的应当是自己的一份，改它不该动到内核。
+				outcome.Attempts[0].Channel = "宿主改过的"
+				outcome.Attempts[0].Status = 999
+			})
+		}))
+
+	status, _, body := post(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`)
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d %s", status, body)
+	}
+	got := outcomes.wait(t, 1)[0]
+	if len(got.Attempts) != 1 {
+		t.Fatalf("尝试条数不符: %+v", got.Attempts)
+	}
+	if got.Attempts[0].Channel != "upstream" || got.Attempts[0].Status != http.StatusOK {
+		t.Fatalf("中间件改了自己那份 Attempts 却污染了回调那份: %+v", got.Attempts[0])
+	}
+}
+
 // TestOutcomeFromContextOutsideRequest 覆盖不在请求范围内时取不到数据。
 func TestOutcomeFromContextOutsideRequest(t *testing.T) {
 	if got, ok := server.OutcomeFromContext(context.Background()); ok {

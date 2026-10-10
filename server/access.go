@@ -288,7 +288,9 @@ func (r *accessRecord) outcome(duration time.Duration) Outcome {
 		Model:        r.model,
 		Channel:      r.channel,
 		Streaming:    r.streaming,
-		Attempts:     r.tries,
+		// 拷一份交出：交出去的是快照，宿主改写自己那份不会污染内核的记录，
+		// 也不会影响同一请求稍后交给 OnRequestDone 的那份。
+		Attempts: append([]Attempt(nil), r.tries...),
 	}
 	if !r.firstByteAt.IsZero() {
 		outcome.FirstByte = r.firstByteAt.Sub(r.started)

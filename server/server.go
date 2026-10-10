@@ -67,8 +67,10 @@ type Options struct {
 	Middleware func(http.Handler) http.Handler
 	// DisableAccessLog 关掉内核自己那两行访问日志。
 	//
-	// 关掉的是「请求进入」与「请求完成」，request_id 仍然生成、其余 WARN 行照旧带着它，
-	// OutcomeFromContext 与 OnRequestDone 也不受影响。默认为 false，即照常记录。
+	// 关掉的是「请求进入」与「请求完成」，包括失败请求的 WARN 完成行；request_id 仍然
+	// 生成、其余 WARN 行照旧带着它，OutcomeFromContext 与 OnRequestDone 也不受影响。
+	// 进入行里的 client 与 user_agent 会一起没有，需要的话从 Outcome 的同名字段自己记。
+	// 默认为 false，即照常记录。
 	DisableAccessLog bool
 }
 
