@@ -1,0 +1,31 @@
+# 声明
+
+本仓库包含或依赖下列上游项目。
+
+## RelayKit
+
+`github.com/QuantumNous/new-api/relaykit`，版本 v0.3.0，许可 AGPL-3.0。
+
+RelayKit 是 [new-api](https://github.com/QuantumNous/new-api) 拆分出的独立 Go 模块，
+提供四种大模型文本协议的 DTO、请求转换、响应转换与流式事件转换。
+本项目用它承担全部协议转换，没有复制其源码。
+
+版权归 new-api 项目及其贡献者所有。
+
+## moejs
+
+`github.com/Calcium-Ion/moejs`，版本 v0.1.0-alpha.6，许可 Apache-2.0。
+
+moejs 是纯 Go 的 JavaScript 运行时，本项目用它执行插件。
+它以依赖形式引入，源码不在本仓库内。
+
+版权归 Calcium-Ion 及 moejs 项目贡献者所有。
+
+## 其余依赖
+
+各依赖的版本、许可与版权行见 [THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md)。
+
+## 商标
+
+本项目与 new-api、QuantumNous、Anthropic、Google、OpenAI 均无隶属关系。
+文中出现的产品名与商标归各自所有者所有。

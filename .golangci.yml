@@ -1,0 +1,59 @@
+# 门禁用的静态检查配置。
+#
+# `default: none` 是刻意的：不用默认集合，而是逐个显式登记。
+# 这样 golangci-lint 升级时新增的 linter 不会悄悄进来把门禁变红，
+# 每一项都是有人做过取舍的。
+version: "2"
+
+run:
+  timeout: 5m
+  # 让 _test.go 也参与检查：测试代码里的错误返回值、并发陷阱与生产代码同等重要。
+  tests: true
+
+linters:
+  default: none
+  enable:
+    # --- 未处理的错误与返回值 ---
+    - errcheck
+
+    # --- 可读性与结构 ---
+    # mnd: 魔法数字；goconst: 重复字面量；nestif: 过深嵌套
+    - mnd
+    - goconst
+    - nestif
+
+    # --- 官方静态检查（含并发相关的 lostcancel、copylocks 等）---
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+    # --- HTTP / 上下文与资源泄漏 ---
+    # bodyclose: 未关闭的响应体；contextcheck: context 传递断裂；noctx: 未带 context 的请求
+    - bodyclose
+    - contextcheck
+    - noctx
+
+    # --- 常见错误与并发陷阱 ---
+    - copyloopvar
+    - errorlint
+    - nilerr
+
+    # --- 安全 ---
+    - gosec
+
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        # 结构体字段对齐属风格问题，不作为门禁
+        - fieldalignment
+    # 测试里的重复字面量是矢量数据的自然形态（模型名、事件名、JSON 片段），
+    # 只对生产代码要求提常量。
+    goconst:
+      ignore-tests: true
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

@@ -1,0 +1,35 @@
+{
+  "unixNow": 1735689600,
+  "cases": [
+    {
+      "name": "请求末尾加上插件标记",
+      "hook": "onRequest",
+      "args": [
+        {
+          "dialect": "openai",
+          "model": "m",
+          "stream": false,
+          "body": {
+            "model": "m",
+            "messages": [{ "role": "user", "content": "你好" }]
+          }
+        }
+      ],
+      "path": "body.messages.1.content",
+      "expected": "tag=example"
+    },
+    {
+      "name": "没有 messages 时不改写",
+      "hook": "onRequest",
+      "args": [{ "dialect": "openai", "model": "m", "body": { "model": "m" } }],
+      "expected": null
+    },
+    {
+      "name": "响应上打标记",
+      "hook": "onResponse",
+      "args": [{ "dialect": "openai", "model": "m", "body": { "id": "x" } }],
+      "member": "body",
+      "expected": { "id": "x", "plugin": "echo" }
+    }
+  ]
+}

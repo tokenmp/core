@@ -1,0 +1,34 @@
+# core 的示例配置：一个渠道、一条模型规则、一个插件。
+# 复制出去改成自己的渠道即可，凭据只写环境变量名。
+
+listen: 127.0.0.1:8787
+
+log:
+  format: text
+  level: info
+
+channels:
+  - name: openrouter
+    dialect: openai
+    base_url: https://openrouter.ai/api/v1
+    # 基址已经带了 /api/v1，因此这里显式给出从它之后的路径。
+    path: /chat/completions
+    auth:
+      style: bearer
+      key_env: OPENROUTER_API_KEY
+    timeout: 120s
+
+models:
+  - match: "gpt-*"
+    channel: openrouter
+  - match: "claude-*"
+    channel: openrouter
+
+plugins:
+  dir: plugins
+  list:
+    - key: echo
+      enabled: true
+      order: 10
+      config:
+        tag: example
