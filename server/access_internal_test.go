@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
@@ -44,32 +43,17 @@ func TestAccessWriterRecordsImplicitStatus(t *testing.T) {
 	}
 }
 
-// syncBuffer 是带锁的日志缓冲。处理器在另一个 goroutine 里写日志，直接读
-// bytes.Buffer 会构成数据竞争，-race 下会被报出来。
-type syncBuffer struct {
-	mu  sync.Mutex
-	buf bytes.Buffer
-}
-
-func (b *syncBuffer) Write(data []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.Write(data)
-}
-
-func (b *syncBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
 // TestAccessMiddlewareLogsArrivalBeforeHandlerReturns 覆盖进入行的时序：处理器还在
 // 跑、请求尚未完成时，进入行就已经写出。
 //
-// 这正是进入行存在的理由——只靠完成行时，流式响应跑的几分钟里日志看不出请求正在跑，
-// 请求卡住或进程被杀时留下的是一条永远不会出现的完成行。
+// 这正是进入行存在的理由——只靠完成行时，流式响应跑的几分钟里日志看不出请求正在跑；
+// 请求卡住或进程被杀时完成行不再出现，至少还留下这一行。
+//
+// 日志缓冲不需要加锁：三次读取都排在 channel 之后，handler goroutine 里对应的写入与
+// 读取之间因此有 happens-before 关系，去掉进入行的改动仍能通过 -race。以后若在未经
+// channel 的位置读它，-race 会把新出现的竞争报出来。
 func TestAccessMiddlewareLogsArrivalBeforeHandlerReturns(t *testing.T) {
-	logs := &syncBuffer{}
+	logs := &bytes.Buffer{}
 	service := &Server{logger: slog.New(slog.NewJSONHandler(logs, nil)), now: time.Now}
 
 	entered := make(chan struct{})

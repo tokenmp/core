@@ -100,7 +100,9 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 			method:    request.Method,
 			path:      request.URL.Path,
 			client:    clientAddress(request.RemoteAddr),
-			started:   s.now(),
+			// started 取在写进入行之前。duration 记的是客户端等待的时长，日志 sink 慢
+			// 带来的拖延也一样拖了客户端，不该从这段时长里排除掉。
+			started: s.now(),
 		}
 		s.logArrival(record)
 		tracked := &accessWriter{ResponseWriter: writer, record: record}
@@ -122,16 +124,17 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 
 // logArrival 写出请求进入的那一行。
 //
-// 与完成行分开记，是因为两者回答的问题不同。完成行回答「这个请求最后怎么了」；
+// 进入行与完成行分开记，是因为两者回答的问题不同。完成行回答「这个请求最后怎么了」；
 // 转发路径只在请求结束时写日志，请求进来之后、结束之前本来没有痕迹。流式响应可能
-// 持续几分钟，这期间日志里看不出请求正在跑；请求卡住或进程被杀时，留下的是一条永远
-// 不会出现的完成行。进入行补上这段空档，顺带让「同时有多少请求在处理」变得可观测。
+// 持续几分钟，这期间日志里看不出请求正在跑；请求卡住或进程被杀时，至少还留下这一行。
+//
+// 代价是每个请求多一行，默认级别下日志量翻倍。换到的只有时序：字段是完成行里在进入
+// 时就已经确定的那四个，两行因此可以逐字段对照。User-Agent 与会话标识在进入时也已经
+// 知道，但访问日志的两行都不带它们；要不要把这两个收进字段集是另一个决定，不该由这
+// 一行顺手定下。
 //
 // 记 INFO 而不是 DEBUG。进入时还不知道结果，没有状态码可以分级；而默认的 log.level
 // 是 info，把进入行记成 DEBUG 等于默认看不见，上面那点可见性就拿不到。
-//
-// 只记进入时确实知道的四个字段。model 与 channel 要等路由和亲和决策，attempts 与
-// status、duration 要等响应，这些都留在完成行里，两行靠 request_id 串起来。
 func (s *Server) logArrival(record *accessRecord) {
 	s.logger.Info("请求进入",
 		"request_id", record.requestID,
