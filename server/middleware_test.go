@@ -158,7 +158,8 @@ func TestOnRequestDoneStateReachesCallback(t *testing.T) {
 // TestMiddlewareCanChangeRequestAndResponse 覆盖「操作这些数据」：中间件能换掉请求体
 // （内核从 request.Body 读，因此换过之后参与路由的就是新的），也能加回给客户端的响应头。
 //
-// 改请求头不会传到上游：上游请求头来自渠道配置，内核不从进来的请求里抄。
+// 直接改进来的请求头不会传到上游：上游请求头来自渠道配置与 Auth，内核不从请求里抄。
+// 要按请求给上游加头得走 server.WithUpstreamHeader，见 upstream_test.go。
 func TestMiddlewareCanChangeRequestAndResponse(t *testing.T) {
 	const replaced = `{"model":"client-model","messages":[{"role":"user","content":"宿主换过的"}]}`
 	upstreamRecord, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
@@ -170,6 +171,7 @@ func TestMiddlewareCanChangeRequestAndResponse(t *testing.T) {
 				_ = request.Body.Close()
 				request.Body = io.NopCloser(strings.NewReader(replaced))
 				request.ContentLength = int64(len(replaced))
+				request.Header.Set("X-Direct", "宿主直接改的")
 				writer.Header().Set("X-Host-Reply", "宿主加的")
 				next.ServeHTTP(writer, request)
 			})
@@ -185,6 +187,9 @@ func TestMiddlewareCanChangeRequestAndResponse(t *testing.T) {
 	}
 	if got := string(upstreamRecord.last(t).Body); got != replaced {
 		t.Fatalf("上游收到的请求体应当是中间件换过的那个:\n期望 %s\n实际 %s", replaced, got)
+	}
+	if got := upstreamRecord.last(t).Header.Get("X-Direct"); got != "" {
+		t.Fatalf("直接改进来的请求头不该传到上游: X-Direct=%q", got)
 	}
 	if got := outcomes.wait(t, 1)[0]; got.Status != http.StatusOK {
 		t.Fatalf("Outcome 不符: %+v", got)

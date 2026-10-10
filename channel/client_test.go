@@ -173,6 +173,43 @@ func headerName(item authCase) string {
 	}
 }
 
+// TestClientRequestHeaderOverridesSpecHeaders 钉住两条来源的先后：Spec.Headers 是渠道级的
+// 默认值，Request.Header 是请求级的值，同名时后者覆盖前者，线上只出现一条。
+func TestClientRequestHeaderOverridesSpecHeaders(t *testing.T) {
+	var got http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		got = request.Header.Clone()
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	client, err := channel.NewClient(channel.Spec{
+		Name:    "a",
+		Dialect: dialect.OpenAIChat,
+		BaseURL: server.URL,
+		Headers: map[string]string{"X-Title": "from-config", "X-Stays": "keep"},
+	})
+	if err != nil {
+		t.Fatalf("创建客户端失败: %v", err)
+	}
+	response, err := client.Send(context.Background(), channel.Request{
+		Body:   []byte(`{}`),
+		Header: http.Header{"X-Title": {"from-request"}},
+	})
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+
+	if values := got.Values("X-Title"); len(values) != 1 || values[0] != "from-request" {
+		t.Fatalf("请求级的同名头应当覆盖渠道配置: X-Title=%v", values)
+	}
+	if value := got.Get("X-Stays"); value != "keep" {
+		t.Fatalf("渠道配置里没被覆盖的头应当照旧: X-Stays=%q", value)
+	}
+}
+
 func TestClientBasePathAndGeminiPath(t *testing.T) {
 	var gotPath string
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
