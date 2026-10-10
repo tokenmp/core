@@ -50,16 +50,20 @@ type Options struct {
 	// MaxBodyBytes 是单个请求体的上限，为 0 时用 config.DefaultMaxBodyBytes。
 	MaxBodyBytes int64
 	// OnRequestDone 在每次请求结束时同步调用，交出这次请求的原始量。
+	//
+	// ctx 是本次请求一直沿用下来的那个：宿主在 Options.Middleware 里加进 context 的
+	// 值在这里能读到，用来把请求级的记账状态跟结束时这份原始量对上。
+	//
 	// 为 nil 时什么也不做，也不构造 Outcome。
-	OnRequestDone func(Outcome)
-	// Middleware 包住内核的处理器，装在访问日志的内侧。宿主在这里记自己的日志、
+	OnRequestDone func(context.Context, Outcome)
+	// Middleware 包住内核的整个处理器，包括访问日志。宿主在这里记自己的日志、
 	// 测首字节、加响应头、接 tracing，也可以换掉请求体（内核从 request.Body 读，
-	// 换过之后参与路由的就是新内容）。
+	// 换过之后参与路由的就是新内容）或根本不调用 next。
+	//
+	// 装在外侧：宿主加进 context 的值会一路传下去，OnRequestDone 的 ctx 里有它。
 	//
 	// 改请求头不会传到上游：上游请求头来自渠道配置与 `Auth`，内核不从进来的请求里抄。
 	//
-	// 它拿到的 context 里已经有本次请求的访问记录，因此在 next 返回之后可以用
-	// OutcomeFromContext 读到内核的内部数据（渠道、每次尝试、用量、首字节时间等）。
 	// 包装 http.ResponseWriter 时必须把 Flush 转发下去，否则流式响应会静默退化成
 	// 不刷新。
 	//
@@ -68,7 +72,7 @@ type Options struct {
 	// DisableAccessLog 关掉内核自己那两行访问日志。
 	//
 	// 关掉的是「请求进入」与「请求完成」，包括失败请求的 WARN 完成行；request_id 仍然
-	// 生成、其余 WARN 行照旧带着它，OutcomeFromContext 与 OnRequestDone 也不受影响。
+	// 生成、其余 WARN 行照旧带着它，OnRequestDone 也不受影响。
 	// 进入行里的 client 与 user_agent 会一起没有，需要的话从 Outcome 的同名字段自己记。
 	// 默认为 false，即照常记录。
 	DisableAccessLog bool
@@ -78,7 +82,7 @@ type Options struct {
 type Option func(*Options)
 
 // WithRequestDone 设置每次请求结束时调用的回调，见 Options.OnRequestDone。
-func WithRequestDone(onDone func(Outcome)) Option {
+func WithRequestDone(onDone func(context.Context, Outcome)) Option {
 	return func(options *Options) { options.OnRequestDone = onDone }
 }
 
@@ -109,9 +113,7 @@ type Server struct {
 	// minPrefixBytes 是前缀的字节下限，短于它时不做亲和。零表示不判断。
 	minPrefixBytes int
 	// onRequestDone 是宿主的请求结束回调，为 nil 表示不回调。
-	onRequestDone func(Outcome)
-	// middleware 是宿主包在内核处理器外面的中间件，为 nil 表示不装。
-	middleware func(http.Handler) http.Handler
+	onRequestDone func(context.Context, Outcome)
 	// disableAccessLog 为真时不写内核自己那两行访问日志。
 	disableAccessLog bool
 }
@@ -159,10 +161,14 @@ func New(opts Options) (*Server, error) {
 		),
 		minPrefixBytes:   opts.Config.AffinityMinPrefixBytes(),
 		onRequestDone:    opts.OnRequestDone,
-		middleware:       opts.Middleware,
 		disableAccessLog: opts.DisableAccessLog,
 	}
 	server.handler = server.routes()
+	if opts.Middleware != nil {
+		// 装在外侧：宿主中间件才是服务的边界，访问日志包在它里面。这样宿主往
+		// context 里加的值会一路传下去，OnRequestDone 收到的 ctx 里有它。
+		server.handler = opts.Middleware(server.handler)
+	}
 	return server, nil
 }
 

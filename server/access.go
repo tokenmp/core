@@ -52,9 +52,6 @@ type accessRecord struct {
 	// tries 按顺序记下每条候选的尝试，访问日志的 attempts 与交回宿主的
 	// Outcome.Attempts 都是它，两个出口因此不会对不上。
 	tries []Attempt
-	// now 与 Server 用同一个时间源。放在记录上是为了让 OutcomeFromContext
-	// 这个包级函数也能算出「到现在为止」的时长。
-	now func() time.Time
 }
 
 // accessRecordKey 是记录在 context 里的键。用私有类型避免与别的包撞键。
@@ -150,7 +147,6 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 			// started 取在写进入行之前。duration 记的是客户端等待的时长，日志 sink 慢
 			// 带来的拖延也一样拖了客户端，不该从这段时长里排除掉。
 			started: s.now(),
-			now:     s.now,
 		}
 		s.logArrival(record)
 		tracked := &accessWriter{ResponseWriter: writer, record: record, now: s.now}
@@ -161,10 +157,10 @@ func (s *Server) withAccessLog(next http.Handler) http.Handler {
 				// 未写响应头的默认值记成 200。抛出之后 net/http 原有的 panic
 				// 处理，以及 http.ErrAbortHandler 的语义都不变。
 				record.status = http.StatusInternalServerError
-				s.finish(record)
+				s.finish(record, ctx)
 				panic(recovered)
 			}
-			s.finish(record)
+			s.finish(record, ctx)
 		}()
 		next.ServeHTTP(tracked, request.WithContext(ctx))
 	})
@@ -244,10 +240,10 @@ func effectiveStatus(record *accessRecord) int {
 //
 // 结束时刻在这里采一次，日志与 Outcome 用同一个值。采在 logAccess 之前：日志 sink 慢的
 // 时候，写完成行的耗时不应当算进这次请求的服务时长。
-func (s *Server) finish(record *accessRecord) {
+func (s *Server) finish(record *accessRecord, ctx context.Context) {
 	finished := s.now()
 	s.logAccess(record, finished)
-	s.notify(record, finished)
+	s.notify(record, finished, ctx)
 }
 
 // notify 把这次请求的原始量交给宿主。
@@ -257,7 +253,7 @@ func (s *Server) finish(record *accessRecord) {
 //
 // 没设回调时不构造 Outcome。尝试列表不在此列：访问日志的 attempts 就是它算出来的，
 // 不设回调也照记。
-func (s *Server) notify(record *accessRecord, finished time.Time) {
+func (s *Server) notify(record *accessRecord, finished time.Time, ctx context.Context) {
 	if s.onRequestDone == nil {
 		return
 	}
@@ -268,7 +264,7 @@ func (s *Server) notify(record *accessRecord, finished time.Time) {
 				"error", fmt.Sprint(recovered))
 		}
 	}()
-	s.onRequestDone(record.outcome(finished.Sub(record.started)))
+	s.onRequestDone(ctx, record.outcome(finished.Sub(record.started)))
 }
 
 // outcome 把访问记录整理成交给宿主的原始量。

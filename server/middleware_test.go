@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/tokenmp/core/config"
 	"github.com/tokenmp/core/server"
@@ -43,9 +45,10 @@ func newSeamServer(t *testing.T, yaml string, extra ...server.Option) (*httptest
 	return front, logs, collector
 }
 
-// TestMiddlewareNestsInsideAccessLog 覆盖中间件的嵌套位置：内核的进入行在它之前写出，
-// 完成行在它之后写出。位置换到外侧的话 context 里就没有访问记录，OutcomeFromContext 会失败。
-func TestMiddlewareNestsInsideAccessLog(t *testing.T) {
+// TestMiddlewareNestsOutsideAccessLog 覆盖中间件的嵌套位置：它包在内核整个处理器（含访问
+// 日志）的外面，因此启动时进入行还没写，收尾时两行都写完了。位置换到内侧的话，宿主加进
+// context 的值就传不到回调。
+func TestMiddlewareNestsOutsideAccessLog(t *testing.T) {
 	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
 		writeJSON(writer, http.StatusOK, openAIChatResponse)
 	})
@@ -56,13 +59,13 @@ func TestMiddlewareNestsInsideAccessLog(t *testing.T) {
 	logs := &logBuffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	var arrivedWritten, completionPending bool
+	var arrivalPending, completionDone bool
 	handler, err := server.FromConfigWith(cfg, logger, server.WithMiddleware(
 		func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				arrivedWritten = strings.Contains(logs.String(), "请求进入")
+				arrivalPending = !strings.Contains(logs.String(), "请求进入")
 				next.ServeHTTP(writer, request)
-				completionPending = !strings.Contains(logs.String(), "请求完成")
+				completionDone = strings.Contains(logs.String(), "请求完成")
 			})
 		}))
 	if err != nil {
@@ -76,54 +79,79 @@ func TestMiddlewareNestsInsideAccessLog(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("状态码不符: %d %s", status, body)
 	}
-	if !arrivedWritten {
-		t.Fatal("中间件启动时进入行应当已经写出：中间件装到了访问日志的外侧")
+	if !arrivalPending {
+		t.Fatal("中间件启动时进入行不应当已经写出：中间件装到了访问日志的内侧")
 	}
-	if !completionPending {
-		t.Fatal("中间件收尾时完成行不应当已经写出：中间件装到了访问日志的外侧")
+	if !completionDone {
+		t.Fatal("中间件收尾时完成行应当已经写出：中间件装到了访问日志的内侧")
 	}
 }
 
-// TestMiddlewareReadsOutcomeFromContext 覆盖这个缺口的主要用途：宿主在自己中间件里
-// next 返回之后读到内核的内部数据，不必去解析日志。
-func TestMiddlewareReadsOutcomeFromContext(t *testing.T) {
+// testTagKey 是宿主加进 context 的自取键。
+type testTagKey struct{}
+
+// TestOnRequestDoneStateReachesCallback 是上一条的正式形态：中间件加进 context 的状态
+// 必须在回调里读到。
+func TestOnRequestDoneStateReachesCallback(t *testing.T) {
 	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
 		writeJSON(writer, http.StatusOK, openAIChatResponse)
 	})
 	var (
-		got    server.Outcome
-		usable bool
+		mu       sync.Mutex
+		gotTag   string
+		got      server.Outcome
+		hadTag   bool
+		callback bool
 	)
-	front, _, _ := newSeamServer(t, seamYAML(upstreamServer.URL), server.WithMiddleware(
-		func(next http.Handler) http.Handler {
-			return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				next.ServeHTTP(writer, request)
-				got, usable = server.OutcomeFromContext(request.Context())
-			})
+	front, _, _ := newSeamServer(t, seamYAML(upstreamServer.URL),
+		server.WithMiddleware(
+			func(next http.Handler) http.Handler {
+				return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+					ctx := context.WithValue(request.Context(), testTagKey{}, "宿主放的")
+					next.ServeHTTP(writer, request.WithContext(ctx))
+				})
+			}),
+		server.WithRequestDone(func(ctx context.Context, outcome server.Outcome) {
+			mu.Lock()
+			defer mu.Unlock()
+			callback = true
+			got = outcome
+			if tag, ok := ctx.Value(testTagKey{}).(string); ok {
+				hadTag = true
+				gotTag = tag
+			}
 		}))
 
-	status, _, body := post(t, front.URL+"/v1/messages",
-		`{"model":"client-model","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}`)
+	status, _, body := post(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`)
 	if status != http.StatusOK {
 		t.Fatalf("状态码不符: %d %s", status, body)
 	}
-	if !usable {
-		t.Fatal("中间件里应当能读到本次请求的 Outcome")
+
+	// 等回调跑完：响应对客户端可见可能早于服务端收尾。
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		mu.Lock()
+		done := callback
+		mu.Unlock()
+		if done {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("回调 3 秒内没有执行")
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
-	if got.RequestID == "" || got.Channel != "upstream" || got.Status != http.StatusOK {
-		t.Fatalf("内部数据不全: %+v", got)
+	mu.Lock()
+	defer mu.Unlock()
+	if !hadTag || gotTag != "宿主放的" {
+		t.Fatalf("中间件加进 context 的状态没到回调: had=%t tag=%q", hadTag, gotTag)
 	}
-	if len(got.Attempts) != 1 || got.Attempts[0].Status != http.StatusOK {
-		t.Fatalf("候选尝试没读到: %+v", got.Attempts)
+	if got.Channel != "upstream" || len(got.Attempts) != 1 || got.Status != http.StatusOK {
+		t.Fatalf("回调拿到的 Outcome 不全: %+v", got)
 	}
-	if got.Usage == nil || got.Usage.TotalTokens != 5 {
-		t.Fatalf("用量没读到: %+v", got.Usage)
-	}
-	if got.FirstByte <= 0 || got.Duration <= 0 {
-		t.Fatalf("时长没读到: first=%v duration=%v", got.FirstByte, got.Duration)
-	}
-	if got.BytesWritten != int64(len(body)) {
-		t.Fatalf("写出字节数不符: %d，客户端收到 %d", got.BytesWritten, len(body))
+	if got.RequestID == "" {
+		t.Fatalf("request_id 不能为空: %+v", got)
 	}
 }
 
@@ -139,7 +167,6 @@ func TestMiddlewareCanChangeRequestAndResponse(t *testing.T) {
 	front, _, outcomes := newSeamServer(t, seamYAML(upstreamServer.URL), server.WithMiddleware(
 		func(next http.Handler) http.Handler {
 			return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				// 内核从这里读请求体，换掉之后走的就是新内容。
 				_ = request.Body.Close()
 				request.Body = io.NopCloser(strings.NewReader(replaced))
 				request.ContentLength = int64(len(replaced))
@@ -218,7 +245,6 @@ models:
 	if status != http.StatusBadGateway {
 		t.Fatalf("候选全部失败应当 502: %d", status)
 	}
-	// 等 WARN 行写出来再断言，否则会有竞态。
 	lines := waitForLog(t, logs, "上游请求失败", 1)
 	if text := logs.String(); strings.Contains(text, "请求进入") || strings.Contains(text, "请求完成") {
 		t.Fatalf("关掉访问日志之后不该有这两行: %s", text)
@@ -230,92 +256,6 @@ models:
 	outcome := outcomes.wait(t, 1)[0]
 	if outcome.RequestID == "" || outcome.Status != http.StatusBadGateway {
 		t.Fatalf("Outcome 不受关日志影响: %+v", outcome)
-	}
-}
-
-// TestOutcomeFromContextBeforeNextIsPartial 覆盖文档写明的边界：在 next 返回之前调用只会
-// 拿到一份残缺的快照。状态码按「没写出响应头就是 200」记，不是这一时刻真的写了什么。
-func TestOutcomeFromContextBeforeNextIsPartial(t *testing.T) {
-	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
-		writeJSON(writer, http.StatusOK, openAIChatResponse)
-	})
-	var (
-		early  server.Outcome
-		usable bool
-	)
-	front, _, _ := newSeamServer(t, seamYAML(upstreamServer.URL), server.WithMiddleware(
-		func(next http.Handler) http.Handler {
-			return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				early, usable = server.OutcomeFromContext(request.Context())
-				next.ServeHTTP(writer, request)
-			})
-		}))
-
-	status, _, body := post(t, front.URL+"/v1/chat/completions",
-		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`)
-	if status != http.StatusOK {
-		t.Fatalf("状态码不符: %d %s", status, body)
-	}
-	if !usable {
-		t.Fatal("请求范围内应当取得到")
-	}
-	if early.RequestID == "" {
-		t.Fatalf("记录在进入时就建好了，request_id 不该是空的: %+v", early)
-	}
-	// 转发还没发生，内部数据都还是零值。
-	if early.Model != "" || early.Channel != "" || len(early.Attempts) != 0 || early.Usage != nil {
-		t.Fatalf("next 之前不该有内部数据: %+v", early)
-	}
-	if early.BytesWritten != 0 || early.FirstByte != 0 {
-		t.Fatalf("还没写响应，首字节与字节数都应当是 0: %+v", early)
-	}
-	// 状态码按约定记 200，不是这一时刻写了什么——文档因此要求在 next 之后读。
-	if early.Status != http.StatusOK {
-		t.Fatalf("快照里的状态码按「没写出响应头就是 200」记: %d", early.Status)
-	}
-}
-
-// TestOutcomeIsASnapshotNotAlias 覆盖 Outcome 是快照而不是内部数据的别名：宿主改了自己
-// 拿到的那份 Attempts，不该影响同一请求稍后交给 OnRequestDone 的那份。
-//
-// 回调跑在中间件收尾之后，因此中间件要是汄染了内核的记录，这里就能看出来。
-func TestOutcomeIsASnapshotNotAlias(t *testing.T) {
-	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
-		writeJSON(writer, http.StatusOK, openAIChatResponse)
-	})
-	front, _, outcomes := newSeamServer(t, seamYAML(upstreamServer.URL), server.WithMiddleware(
-		func(next http.Handler) http.Handler {
-			return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				next.ServeHTTP(writer, request)
-				outcome, ok := server.OutcomeFromContext(request.Context())
-				if !ok || len(outcome.Attempts) == 0 {
-					t.Errorf("中间件里应当读得到尝试列表")
-					return
-				}
-				// 宿主手上的应当是自己的一份，改它不该动到内核。
-				outcome.Attempts[0].Channel = "宿主改过的"
-				outcome.Attempts[0].Status = 999
-			})
-		}))
-
-	status, _, body := post(t, front.URL+"/v1/chat/completions",
-		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`)
-	if status != http.StatusOK {
-		t.Fatalf("状态码不符: %d %s", status, body)
-	}
-	got := outcomes.wait(t, 1)[0]
-	if len(got.Attempts) != 1 {
-		t.Fatalf("尝试条数不符: %+v", got.Attempts)
-	}
-	if got.Attempts[0].Channel != "upstream" || got.Attempts[0].Status != http.StatusOK {
-		t.Fatalf("中间件改了自己那份 Attempts 却污染了回调那份: %+v", got.Attempts[0])
-	}
-}
-
-// TestOutcomeFromContextOutsideRequest 覆盖不在请求范围内时取不到数据。
-func TestOutcomeFromContextOutsideRequest(t *testing.T) {
-	if got, ok := server.OutcomeFromContext(context.Background()); ok {
-		t.Fatalf("不在请求范围内应当取不到: %+v", got)
 	}
 }
 
@@ -338,7 +278,6 @@ func TestSeamServerStillServesWithoutMiddleware(t *testing.T) {
 	if got := outcomes.wait(t, 1)[0]; got.Channel != "upstream" {
 		t.Fatalf("Outcome 不符: %+v", got)
 	}
-	// 中间件没装时 OutcomeFromContext 在 handler 之外自然取不到。
 	response, err := get(t, front.URL+"/healthz")
 	if err != nil {
 		t.Fatalf("请求失败: %v", err)
