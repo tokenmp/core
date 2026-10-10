@@ -27,20 +27,35 @@ func (s *Server) writeStream(
 	response *http.Response,
 ) {
 	ctx := request.Context()
+	// 会话先建好再写响应头：建不出来时还能正常回一个错误状态码，
+	// 而不是先写出 200 再留一条空的流。
+	var session *relay.Stream
+	if !prepared.Passthrough {
+		created, err := s.engine.NewStream(route.Dialect, client, model, route.Upstream, relay.StreamOptions{
+			Model:        model,
+			Created:      s.now().Unix(),
+			IncludeUsage: true,
+		})
+		if err != nil {
+			s.logger.Warn("创建流式转换会话失败", "error", err.Error())
+			s.writeError(writer, http.StatusBadGateway, "conversion_error", err.Error())
+			return
+		}
+		session = created
+	}
 	header := writer.Header()
 	header.Set("Content-Type", "text/event-stream")
 	header.Set("Cache-Control", "no-cache")
-	header.Set("Connection", "keep-alive")
 	header.Set("X-Accel-Buffering", "no")
 	writer.WriteHeader(http.StatusOK)
 	flusher, _ := writer.(http.Flusher)
 	out := channel.NewWriter(writer)
 
-	if prepared.Passthrough {
+	if session == nil {
 		s.pipeStream(ctx, writer, client, model, response, out, flusher)
 		return
 	}
-	s.convertStream(ctx, client, model, route, response, out)
+	s.convertStream(ctx, client, model, session, response, out)
 }
 
 // pipeStream 转发同方言的上游流。没有插件订阅 onEvent 时按字节搬运，原始报文
@@ -90,31 +105,26 @@ func (s *Server) pipeStream(
 }
 
 // convertStream 转发跨方言的上游流。
+//
+// 上游中途出错时不补终止帧：客户端收不到结束标记就知道这一条回答被截断了。
+// 补一个正常的终止帧会让截断看起来像正常结束。
 func (s *Server) convertStream(
 	ctx context.Context,
 	client dialect.Name,
 	model string,
-	route config.Route,
+	stream *relay.Stream,
 	response *http.Response,
 	out *channel.Writer,
 ) {
-	stream, err := s.engine.NewStream(route.Dialect, client, model, route.Upstream, relay.StreamOptions{
-		Model:        model,
-		Created:      s.now().Unix(),
-		IncludeUsage: true,
-	})
-	if err != nil {
-		s.logger.Warn("创建流式转换会话失败", "error", err.Error())
-		return
-	}
 	reader := channel.NewReader(response.Body)
+	failure := ""
 	for {
 		event, readErr := reader.Next()
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
 		if readErr != nil {
-			s.logger.Warn("读取上游流失败", "error", readErr.Error())
+			failure = readErr.Error()
 			break
 		}
 		if dialect.IsDoneMarker(event.Data) {
@@ -122,13 +132,22 @@ func (s *Server) convertStream(
 		}
 		converted, convertErr := stream.Convert(ctx, event.Data)
 		if convertErr != nil {
-			s.logger.Warn("转换流式分片失败", "error", convertErr.Error())
+			failure = convertErr.Error()
 			break
 		}
 		if writeErr := s.writeEvents(ctx, client, model, converted, out); writeErr != nil {
 			s.logger.Warn("写出流式事件失败", "error", writeErr.Error())
 			return
 		}
+	}
+	if failure != "" {
+		s.logger.Warn("上游流中断", "model", model, "error", failure)
+		if events, ok := stream.Fail("upstream_stream_error", failure, ""); ok {
+			if writeErr := s.writeEvents(ctx, client, model, events, out); writeErr != nil {
+				s.logger.Warn("写出错误事件失败", "error", writeErr.Error())
+			}
+		}
+		return
 	}
 	final, err := stream.Finalize(ctx)
 	if err != nil {
@@ -189,20 +208,20 @@ func (s *Server) rewriteEvent(ctx context.Context, client dialect.Name, event st
 	if err != nil {
 		return channel.Event{}, err
 	}
-	outcome := s.plugins.Invoke(ctx, plugin.HookEvent, payload, nil, s.session())
+	outcome := s.plugins.Apply(ctx, plugin.HookEvent, payload, mergeEvent, nil, s.session())
 	if !outcome.Changed() {
 		return channel.Event{Name: event, Data: data}, nil
 	}
-	var rewrite eventRewrite
-	if err := json.Unmarshal(outcome.Data, &rewrite); err != nil {
+	var final eventPayload
+	if err := json.Unmarshal(outcome.Data, &final); err != nil {
 		return channel.Event{}, err
 	}
 	updated := channel.Event{Name: event, Data: data}
-	if rewrite.Event != nil {
-		updated.Name = *rewrite.Event
+	if final.Event != "" {
+		updated.Name = final.Event
 	}
-	if len(rewrite.Data) > 0 {
-		updated.Data = rewrite.Data
+	if len(final.Data) > 0 {
+		updated.Data = final.Data
 	}
 	return updated, nil
 }
@@ -230,20 +249,20 @@ func (s *Server) rewriteStreamEnd(ctx context.Context, client dialect.Name, mode
 		s.logger.Warn("构造收尾钩子负载失败", "error", err.Error())
 		return events
 	}
-	outcome := s.plugins.Invoke(ctx, plugin.HookStreamEnd, payload, nil, s.session())
+	outcome := s.plugins.Apply(ctx, plugin.HookStreamEnd, payload, mergeStreamEnd, nil, s.session())
 	if !outcome.Changed() {
 		return events
 	}
-	var rewrite streamEndRewrite
-	if err := json.Unmarshal(outcome.Data, &rewrite); err != nil {
+	var final streamEndPayload
+	if err := json.Unmarshal(outcome.Data, &final); err != nil {
 		s.logger.Warn("解析收尾钩子输出失败", "error", err.Error())
 		return events
 	}
-	if rewrite.Events == nil {
+	if final.Events == nil {
 		return events
 	}
-	updated := make([]dialect.StreamEvent, 0, len(rewrite.Events))
-	for _, item := range rewrite.Events {
+	updated := make([]dialect.StreamEvent, 0, len(final.Events))
+	for _, item := range final.Events {
 		updated = append(updated, dialect.StreamEvent{Event: item.Event, Data: item.Data})
 	}
 	return updated

@@ -466,6 +466,86 @@ models:
 	}
 }
 
+func TestStreamFailureDoesNotEmitTerminalFrame(t *testing.T) {
+	// 上游发一个正常分片后送坏 JSON 并断开。补一个正常的终止帧会让截断看起来
+	// 像正常结束，因此这条路径上不写 message_stop。
+	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte(`data: {"id":"1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":"你"}}]}` + "\n\n"))
+		_, _ = writer.Write([]byte("data: {坏 JSON\n\n"))
+	})
+	front := newServer(t, `
+channels:
+  - {name: upstream, dialect: openai, base_url: "`+upstreamServer.URL+`"}
+models:
+  - {match: "client-model", channel: upstream}
+`, "")
+
+	status, _, body := post(t, front.URL+"/v1/messages",
+		`{"model":"client-model","stream":true,"max_tokens":64,"messages":[{"role":"user","content":"你好"}]}`)
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d", status)
+	}
+	if strings.Contains(string(body), "message_stop") {
+		t.Fatalf("上游中断时不应补出终止帧: %s", body)
+	}
+	if !strings.Contains(string(body), "message_start") {
+		t.Fatalf("中断之前的事件应当照常写出: %s", body)
+	}
+}
+
+func TestRouteDialectOverridesChannelDialect(t *testing.T) {
+	// 渠道默认说 OpenAI，模型规则把它改写成 Gemini。上游路径必须跟着规则走，
+	// 否则请求会带着 Gemini 的请求体打到 OpenAI 的路径上。
+	record, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, `{"candidates":[{"content":{"role":"model","parts":[{"text":"你好"}]}}]}`)
+	})
+	front := newServer(t, `
+channels:
+  - {name: upstream, dialect: openai, base_url: "`+upstreamServer.URL+`"}
+models:
+  - {match: "gemini-*", channel: upstream, dialect: gemini}
+`, "")
+
+	status, _, body := post(t, front.URL+"/v1beta/models/gemini-2.5-pro:generateContent",
+		`{"contents":[{"role":"user","parts":[{"text":"你好"}]}]}`)
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d %s", status, body)
+	}
+	if path := record.last(t).Path; path != "/v1beta/models/gemini-2.5-pro:generateContent" {
+		t.Fatalf("上游路径应当跟随模型规则的方言，实际 %s", path)
+	}
+	if !strings.Contains(string(record.last(t).Body), "contents") {
+		t.Fatalf("上游请求体应当是 Gemini 形状: %s", record.last(t).Body)
+	}
+}
+
+func TestGeminiModelNameIsRejected(t *testing.T) {
+	front := newServer(t, `
+channels:
+  - {name: upstream, dialect: gemini, base_url: "https://example.com"}
+models:
+  - {match: "*", channel: upstream}
+`, "")
+	for _, model := range []string{"a%2Fb", "..%2F..%2Fv1%2Fchat%2Fcompletions", "a%3Falt%3Djson"} {
+		request, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+			front.URL+"/v1beta/models/"+model+":generateContent", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatalf("构造请求失败: %v", err)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatalf("请求失败: %v", err)
+		}
+		body, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("模型名 %q 应当 400，实际 %d %s", model, response.StatusCode, body)
+		}
+	}
+}
+
 func TestEventPluginRewritesStreamChunk(t *testing.T) {
 	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "text/event-stream")

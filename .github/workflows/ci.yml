@@ -13,13 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-      - name: 安装 golangci-lint
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
-            | sh -s -- -b "$(go env GOPATH)/bin" v2.14.0
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      # 工具链版本只在 .mise.toml 里声明，CI 通过 mise 读取同一份，
+      # 不在这里另写版本号，避免两处漂移。
+      - uses: jdx/mise-action@v3
       - name: 门禁
         run: make check

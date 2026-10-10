@@ -45,8 +45,12 @@ func (s *Server) forward(writer http.ResponseWriter, request *http.Request, clie
 	}
 
 	body, model = s.rewriteRequest(ctx, client, model, stream, body)
-	routes := s.config.Resolve(model)
+	routes, rejected := usableRoutes(s.config.Resolve(model))
 	if len(routes) == 0 {
+		if rejected != "" {
+			s.writeError(writer, http.StatusBadRequest, "invalid_model", rejected)
+			return
+		}
 		s.writeError(writer, http.StatusNotFound, "model_not_found",
 			fmt.Sprintf("没有匹配模型 %s 的路由", model))
 		return
@@ -60,11 +64,35 @@ func (s *Server) forward(writer http.ResponseWriter, request *http.Request, clie
 	s.writeUpstream(writer, request, client, model, route, prepared, response)
 }
 
+// usableRoutes 过滤掉模型名不适合写进上游路径的路由。
+//
+// 返回的第二个值非空表示所有候选都因此被过滤掉，里面是第一条原因。
+// 模型名来自客户端，不能直接拼进 URL，因此这里在发出请求之前就拦下。
+func usableRoutes(routes []config.Route) ([]config.Route, string) {
+	usable := make([]config.Route, 0, len(routes))
+	reason := ""
+	for _, route := range routes {
+		if route.Dialect == dialect.GeminiGenerate {
+			if err := dialect.ValidateModelName(route.Upstream); err != nil {
+				if reason == "" {
+					reason = err.Error()
+				}
+				continue
+			}
+		}
+		usable = append(usable, route)
+	}
+	if len(usable) == 0 && len(routes) > 0 && reason == "" {
+		return nil, "没有可用的候选路由"
+	}
+	return usable, reason
+}
+
 // callUpstream 按候选路由依次尝试，返回第一个可用的上游响应。
 //
 // 有剩余候选且失败属于「渠道问题」时继续试下一条：连接错误、408、429、401、
 // 403 与 5xx。400、404、422 这类说明请求本身有问题，换渠道不会变好，直接返回。
-// 全部候选都失败时写出最后一次的状态码与前一次尝试的失败原因。
+// 所有候选都在建立连接阶段失败时写出 502 与最后一条失败原因。
 func (s *Server) callUpstream(
 	ctx context.Context,
 	writer http.ResponseWriter,
@@ -95,9 +123,10 @@ func (s *Server) callUpstream(
 			continue
 		}
 		response, err := upstream.Send(ctx, channel.Request{
-			Model:  route.Upstream,
-			Stream: prepared.Stream,
-			Body:   prepared.Body,
+			Dialect: route.Dialect,
+			Model:   route.Upstream,
+			Stream:  prepared.Stream,
+			Body:    prepared.Body,
 		})
 		if err != nil {
 			lastMessage = err.Error()
@@ -138,7 +167,7 @@ func (s *Server) writeUpstream(
 	prepared *relay.Prepared,
 	response *http.Response,
 ) {
-	copyResponseHeaders(writer, response, prepared.Passthrough)
+	copyResponseHeaders(writer, response)
 	if response.StatusCode >= http.StatusBadRequest {
 		// 错误响应按原样透传：不同上游的错误形状差异很大，翻译只会丢掉排查线索。
 		writer.WriteHeader(response.StatusCode)
@@ -210,21 +239,21 @@ func (s *Server) rewriteRequest(ctx context.Context, client dialect.Name, model 
 		s.logger.Warn("构造请求钩子负载失败", "error", err.Error())
 		return body, model
 	}
-	outcome := s.plugins.Invoke(ctx, plugin.HookRequest, payload, nil, s.session())
+	outcome := s.plugins.Apply(ctx, plugin.HookRequest, payload, mergeRequest, nil, s.session())
 	if !outcome.Changed() {
 		return body, model
 	}
-	var rewrite requestRewrite
-	if err := json.Unmarshal(outcome.Data, &rewrite); err != nil {
+	var final requestPayload
+	if err := json.Unmarshal(outcome.Data, &final); err != nil {
 		s.logger.Warn("解析请求钩子输出失败", "plugins", outcome.Applied, "error", err.Error())
 		return body, model
 	}
 	updated := body
-	if len(rewrite.Body) > 0 {
-		updated = rewrite.Body
+	if len(final.Body) > 0 {
+		updated = final.Body
 	}
-	if rewrite.Model != nil && *rewrite.Model != "" {
-		model = *rewrite.Model
+	if final.Model != "" {
+		model = final.Model
 	}
 	s.logger.Debug("请求钩子生效", "plugins", outcome.Applied, "model", model)
 	return updated, model
@@ -244,20 +273,20 @@ func (s *Server) rewriteResponse(ctx context.Context, client dialect.Name, model
 		s.logger.Warn("构造响应钩子负载失败", "error", err.Error())
 		return body
 	}
-	outcome := s.plugins.Invoke(ctx, plugin.HookResponse, payload, nil, s.session())
+	outcome := s.plugins.Apply(ctx, plugin.HookResponse, payload, mergeResponse, nil, s.session())
 	if !outcome.Changed() {
 		return body
 	}
-	var rewrite responseRewrite
-	if err := json.Unmarshal(outcome.Data, &rewrite); err != nil {
+	var final responsePayload
+	if err := json.Unmarshal(outcome.Data, &final); err != nil {
 		s.logger.Warn("解析响应钩子输出失败", "plugins", outcome.Applied, "error", err.Error())
 		return body
 	}
-	if len(rewrite.Body) == 0 {
+	if len(final.Body) == 0 {
 		return body
 	}
 	s.logger.Debug("响应钩子生效", "plugins", outcome.Applied)
-	return rewrite.Body
+	return final.Body
 }
 
 // session 返回本次调用的宿主环境。
@@ -287,15 +316,12 @@ func isEventStream(response *http.Response) bool {
 	return strings.HasPrefix(response.Header.Get("Content-Type"), "text/event-stream")
 }
 
-// copyResponseHeaders 复制需要透传的响应头。
-func copyResponseHeaders(writer http.ResponseWriter, response *http.Response, passthrough bool) {
+// copyResponseHeaders 复制需要透传的响应头。转换过的响应会在这之后覆盖
+// Content-Type，错误响应则沿用上游给出的那一个。
+func copyResponseHeaders(writer http.ResponseWriter, response *http.Response) {
 	for _, name := range []string{"Content-Type", "Retry-After", "X-Request-Id"} {
 		value := response.Header.Get(name)
 		if value == "" {
-			continue
-		}
-		if name == "Content-Type" && !passthrough {
-			// 转换过的响应由本方重新生成 body，Content-Type 固定为 JSON 或 SSE。
 			continue
 		}
 		writer.Header().Set(name, value)

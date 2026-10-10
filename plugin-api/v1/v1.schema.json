@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/tokenmp/core/plugin-api/v1/v1.schema.json",
   "title": "TokenMP core 插件契约 v1",
-  "description": "插件模块导出的形状。JSON Schema 没有函数的类型，钩子写成 {\"type\": \"function\"}，只用于文档与静态检查，运行时校验由宿主完成：它检查 meta 的字段与每个钩子是否可调用。",
+  "description": "插件模块导出的形状。JSON Schema 没有函数的类型，钩子写成 {\"type\": \"function\"}，只用于文档与静态检查，运行时校验由宿主完成：它检查 meta 的字段、每个钩子是否可调用，以及至少导出了一个钩子。",
   "type": "object",
   "required": ["meta"],
   "properties": {

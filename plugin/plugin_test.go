@@ -181,6 +181,24 @@ func TestCallRejectsAsyncHook(t *testing.T) {
 	}
 }
 
+func TestCompileInterruptsEndlessTopLevel(t *testing.T) {
+	// 顶层代码由插件编写，和钩子体一样可能失控。加载超时不足会让启动卡死，
+	// 也会让 lint 卡死。
+	source := `export const meta = { key: "top", name: "顶层死循环", version: "1", apiVersion: "v1" };
+for (;;) {}
+export function onRequest() { return null; }`
+	dir := writePlugin(t, "top", source)
+	limits := plugin.DefaultLimits()
+	limits.Timeout = 100 * time.Millisecond
+	start := time.Now()
+	if _, err := plugin.LoadFile(filepath.Join(dir, "top", plugin.PluginFile), limits); err == nil {
+		t.Fatal("顶层死循环应当让加载失败")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("中断耗时过长: %s", elapsed)
+	}
+}
+
 func TestCallInterruptsEndlessHook(t *testing.T) {
 	dir := writePlugin(t, "endless", endlessPlugin)
 	limits := plugin.DefaultLimits()
@@ -369,6 +387,69 @@ func TestLoadFixtureFromFile(t *testing.T) {
 	}
 }
 
+// mergePayload 是测试用的合并函数：把改写里的 model 与 body 合并回负载，
+// 语义与 server 层的 mergeRequest 一致。
+func mergePayload(payload, rewrite []byte) ([]byte, error) {
+	var current map[string]any
+	if err := json.Unmarshal(payload, &current); err != nil {
+		return nil, err
+	}
+	var change map[string]any
+	if err := json.Unmarshal(rewrite, &change); err != nil {
+		return nil, err
+	}
+	changed := false
+	for _, key := range []string{"model", "body", "event", "data", "events"} {
+		value, ok := change[key]
+		if !ok {
+			continue
+		}
+		current[key] = value
+		changed = true
+	}
+	if !changed {
+		return nil, nil
+	}
+	return json.Marshal(current)
+}
+
+// probePlugin 把收到的负载形状写回模型名，用于断言链上每个插件看到的是完整负载。
+const probePlugin = `export const meta = { key: "probe", name: "探针", version: "1", apiVersion: "v1" };
+export function onRequest(input) {
+  return { model: String(input.dialect) + "|" + String(input.model) + "|" + String(input.stream) };
+}
+`
+
+func TestStoreChainKeepsFullPayload(t *testing.T) {
+	echo := loadEcho(t)
+	dir := writePlugin(t, "probe", probePlugin)
+	probeLoaded, err := plugin.LoadFile(filepath.Join(dir, "probe", plugin.PluginFile), plugin.DefaultLimits())
+	if err != nil {
+		t.Fatalf("加载失败: %v", err)
+	}
+	store, err := plugin.NewStore([]plugin.Entry{
+		{Instance: echo, Enabled: true, Order: 1},
+		{Instance: probeLoaded.Bind(nil), Enabled: true, Order: 2},
+	}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("构造集合失败: %v", err)
+	}
+	input := []byte(`{"dialect":"openai","model":"m","stream":true,"body":{"model":"m","messages":[{"role":"user","content":"你好"}]}}`)
+	outcome := store.Apply(context.Background(), plugin.HookRequest, input, mergePayload, nil, plugin.Session{})
+	if len(outcome.Failures) != 0 {
+		t.Fatalf("不应有失败: %+v", outcome.Failures)
+	}
+	var payload struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(outcome.Data, &payload); err != nil {
+		t.Fatalf("解析负载失败: %v", err)
+	}
+	if payload.Model != "openai|m|true" {
+		t.Fatalf("链上第二个插件应当看到完整负载，实际模型名 %q", payload.Model)
+	}
+}
+
 func TestStoreInvokeChainAndFailureIsolation(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	good := loadEcho(t)
@@ -386,7 +467,7 @@ export function onRequest() { throw new Error("故意失败"); }`)
 		t.Fatalf("构造集合失败: %v", err)
 	}
 	input := []byte(`{"body":{"model":"m","messages":[{"role":"user","content":"你好"}]}}`)
-	outcome := store.Invoke(context.Background(), plugin.HookRequest, input, nil, plugin.Session{})
+	outcome := store.Apply(context.Background(), plugin.HookRequest, input, mergePayload, nil, plugin.Session{})
 	if len(outcome.Failures) != 1 || outcome.Failures[0].Key != "broken" {
 		t.Fatalf("应当记录一次失败: %+v", outcome.Failures)
 	}
@@ -412,7 +493,7 @@ func TestStoreDisabledAndFiltered(t *testing.T) {
 		t.Fatalf("构造集合失败: %v", err)
 	}
 	input := []byte(`{"body":{"model":"m","messages":[]}}`)
-	outcome := store.Invoke(context.Background(), plugin.HookRequest, input, []string{"other"}, plugin.Session{})
+	outcome := store.Apply(context.Background(), plugin.HookRequest, input, mergePayload, []string{"other"}, plugin.Session{})
 	if outcome.Changed() {
 		t.Fatal("过滤条件不匹配时不应改写")
 	}

@@ -116,11 +116,20 @@ func (s *Store) Missing(keys []string) []string {
 	return missing
 }
 
-// Invoke 按顺序对启用插件调用一个钩子。
+// Merger 把插件的改写结果合并回负载。
 //
-// keys 为空表示全部启用插件参与；非空时只有列出的 key 参与，用于按路由限定插件。
+// payload 是合并前的负载，rewrite 是插件返回的新值。返回 nil 表示本次不改写，
+// 返回错误按插件失败处理。
+type Merger func(payload, rewrite []byte) ([]byte, error)
+
+// Apply 按顺序对启用插件调用一个钩子，每个插件看到的是上一个插件改写之后的完整
+// 负载，而不是只看到上一个插件的返回值。
+//
+// keys 为空表示全部启用插件参与；非空时只有列出的 key 参与。
+// merger 为 nil 时，插件返回的新值直接成为下一次调用的负载。
+//
 // 单个插件失败不影响链路：该插件被跳过，前一个成功的改写结果继续传给后面的插件。
-func (s *Store) Invoke(ctx context.Context, hook Hook, input []byte, keys []string, session Session) Outcome {
+func (s *Store) Apply(ctx context.Context, hook Hook, input []byte, merger Merger, keys []string, session Session) Outcome {
 	outcome := Outcome{Data: input}
 	if s == nil || len(s.entries) == 0 {
 		return outcome
@@ -148,10 +157,23 @@ func (s *Store) Invoke(ctx context.Context, hook Hook, input []byte, keys []stri
 			s.log(entry.Key(), hook, err)
 			continue
 		}
-		if changed {
-			outcome.Data = output
-			outcome.Applied = append(outcome.Applied, entry.Key())
+		if !changed {
+			continue
 		}
+		merged := output
+		if merger != nil {
+			merged, err = merger(outcome.Data, output)
+			if err != nil {
+				outcome.Failures = append(outcome.Failures, Failure{Key: entry.Key(), Hook: hook, Err: err})
+				s.log(entry.Key(), hook, err)
+				continue
+			}
+			if merged == nil {
+				continue
+			}
+		}
+		outcome.Data = merged
+		outcome.Applied = append(outcome.Applied, entry.Key())
 	}
 	return outcome
 }

@@ -18,7 +18,7 @@ const DefaultMaxEventBytes = 8 << 20
 const copyBufferBytes = 32 << 10
 
 // ErrEventTooLarge 表示单条事件超过上限。
-var ErrEventTooLarge = errors.New("sse: 事件负载超过上限")
+var ErrEventTooLarge = errors.New("channel: 事件负载超过上限")
 
 // Event 是一条 SSE 事件。
 type Event struct {
@@ -93,12 +93,30 @@ func (r *Reader) Next() (Event, error) {
 }
 
 // readLine 读一行并去掉行尾的 CR/LF。
+//
+// 用 ReadSlice 逐段拼，而不是 ReadString：ReadString 会把整行先读进内存再返回，
+// 上游发一条不含换行的超长行就能把内存吃满。这里每读一段都对照上限。
 func (r *Reader) readLine() (string, error) {
-	line, err := r.reader.ReadString('\n')
-	if err != nil && line == "" {
-		return "", err
+	var line []byte
+	for {
+		chunk, err := r.reader.ReadSlice('\n')
+		line = append(line, chunk...)
+		switch {
+		case err == nil:
+			return trimLineEnding(line), nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			if len(line) > r.maxEventBytes {
+				return "", fmt.Errorf("%w: 单行超过 %d 字节", ErrEventTooLarge, r.maxEventBytes)
+			}
+		default:
+			return trimLineEnding(line), err
+		}
 	}
-	return strings.TrimRight(line, "\r\n"), nil
+}
+
+// trimLineEnding 去掉行尾的 CR/LF。
+func trimLineEnding(line []byte) string {
+	return strings.TrimRight(string(line), "\r\n")
 }
 
 // finishEvent 收尾一条事件：去掉拼接时补的最后一个换行。

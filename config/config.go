@@ -15,13 +15,14 @@ import (
 
 // 默认值。只在这里写一次，Load 与文档都以它为准。
 const (
-	DefaultListen        = "127.0.0.1:8787"
-	DefaultLogFormat     = "json"
-	DefaultLogLevel      = "info"
-	DefaultTimeout       = 120 * time.Second
-	DefaultPluginDir     = "plugins"
-	DefaultMaxBodyBytes  = 32 << 20
-	DefaultMaxSourceSize = 1 << 20
+	DefaultListen       = "127.0.0.1:8787"
+	DefaultLogFormat    = "json"
+	DefaultLogLevel     = "info"
+	DefaultTimeout      = 120 * time.Second
+	DefaultPluginDir    = "plugins"
+	DefaultMaxBodyBytes = 32 << 20
+	// MaxRetries 是渠道重试次数的上限，与 channel.MaxRetries 保持一致。
+	MaxRetries = 10
 )
 
 // authStyleNone 表示不鉴权。单列成常量是因为它在校验里有独立分支。
@@ -227,8 +228,8 @@ func (c *Config) Validate() error {
 		if channel.Timeout <= 0 {
 			problems = append(problems, where+": timeout 必须为正")
 		}
-		if channel.MaxRetries != nil && *channel.MaxRetries < 0 {
-			problems = append(problems, where+": max_retries 不能为负")
+		if channel.MaxRetries != nil && (*channel.MaxRetries < 0 || *channel.MaxRetries > MaxRetries) {
+			problems = append(problems, fmt.Sprintf("%s: max_retries 须在 0 到 %d 之间", where, MaxRetries))
 		}
 		problems = append(problems, checkAuth(where+".auth", channel.Auth, channel.Name)...)
 	}

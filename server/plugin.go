@@ -79,3 +79,90 @@ type streamEndRewrite struct {
 	// Events 非空时替换补发的分片。
 	Events []streamEvent `json:"events,omitempty"`
 }
+
+// mergeRequest 把 onRequest 的改写合并回负载。
+//
+// 合并之后下一个插件看到的仍然是完整的 {dialect, model, stream, body}，
+// 而不是只看到上一个插件的返回值。
+func mergeRequest(payload, rewrite []byte) ([]byte, error) {
+	var current requestPayload
+	if err := json.Unmarshal(payload, &current); err != nil {
+		return nil, err
+	}
+	var change requestRewrite
+	if err := json.Unmarshal(rewrite, &change); err != nil {
+		return nil, err
+	}
+	changed := false
+	if change.Model != nil && *change.Model != "" {
+		current.Model = *change.Model
+		changed = true
+	}
+	if len(change.Body) > 0 {
+		current.Body = change.Body
+		changed = true
+	}
+	if !changed {
+		return nil, nil
+	}
+	return json.Marshal(current)
+}
+
+// mergeResponse 把 onResponse 的改写合并回负载。
+func mergeResponse(payload, rewrite []byte) ([]byte, error) {
+	var current responsePayload
+	if err := json.Unmarshal(payload, &current); err != nil {
+		return nil, err
+	}
+	var change responseRewrite
+	if err := json.Unmarshal(rewrite, &change); err != nil {
+		return nil, err
+	}
+	if len(change.Body) == 0 {
+		return nil, nil
+	}
+	current.Body = change.Body
+	return json.Marshal(current)
+}
+
+// mergeEvent 把 onEvent 的改写合并回负载。
+func mergeEvent(payload, rewrite []byte) ([]byte, error) {
+	var current eventPayload
+	if err := json.Unmarshal(payload, &current); err != nil {
+		return nil, err
+	}
+	var change eventRewrite
+	if err := json.Unmarshal(rewrite, &change); err != nil {
+		return nil, err
+	}
+	changed := false
+	if change.Event != nil && *change.Event != "" {
+		current.Event = *change.Event
+		changed = true
+	}
+	if len(change.Data) > 0 {
+		current.Data = change.Data
+		changed = true
+	}
+	if !changed {
+		return nil, nil
+	}
+	return json.Marshal(current)
+}
+
+// mergeStreamEnd 把 onStreamEnd 的改写合并回负载。
+func mergeStreamEnd(payload, rewrite []byte) ([]byte, error) {
+	var current streamEndPayload
+	if err := json.Unmarshal(payload, &current); err != nil {
+		return nil, err
+	}
+	var change streamEndRewrite
+	if err := json.Unmarshal(rewrite, &change); err != nil {
+		return nil, err
+	}
+	if change.Events == nil {
+		return nil, nil
+	}
+	current.Events = change.Events
+	return json.Marshal(current)
+}

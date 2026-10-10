@@ -70,11 +70,6 @@ func NewEngine(opts Options) *Engine {
 	}
 }
 
-// Options 返回内核使用的转换选项快照。
-func (e *Engine) Options() convmeta.Options {
-	return e.options
-}
-
 // ParseModel 按需剥离模型名尾缀。
 //
 // 未打开 ModelSuffix 时原样返回，状态为 nil。打开时识别各家已知尾缀，返回

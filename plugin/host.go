@@ -59,7 +59,7 @@ func Compile(path string, source []byte, limits Limits) (*Loaded, error) {
 		return nil, fmt.Errorf("plugin: 编译 %s 失败: %w", path, err)
 	}
 	runtime := moejs.NewRuntime(runtimeOptions())
-	manifest, hooks, err := inspect(runtime, module)
+	manifest, hooks, err := inspect(runtime, module, limits.Timeout)
 	if err != nil {
 		return nil, fmt.Errorf("plugin: %s: %w", path, err)
 	}
@@ -82,7 +82,13 @@ func runtimeOptions() moejs.Options {
 // inspect 在一个运行时里读出 meta 与钩子导出。
 //
 // 必须先 Load 再 Export：导出绑定要等模块求值完成后才可读。
-func inspect(runtime *moejs.Runtime, module *moejs.Module) (Manifest, map[Hook]moejs.Hook, error) {
+// Load 会执行模块顶层代码，因此这里和调用路径一样带超时。
+func inspect(runtime *moejs.Runtime, module *moejs.Module, timeout time.Duration) (Manifest, map[Hook]moejs.Hook, error) {
+	timer := time.AfterFunc(timeout, func() { runtime.Interrupt(errTimeout{phase: "源码求值", limit: timeout}) })
+	defer func() {
+		timer.Stop()
+		runtime.ClearInterrupt()
+	}()
 	if err := runtime.Load(module); err != nil {
 		return Manifest{}, nil, fmt.Errorf("加载模块失败: %w", err)
 	}
@@ -161,8 +167,9 @@ func LoadFile(path string, limits Limits) (*Loaded, error) {
 func LoadDir(dir string, limits Limits) ([]*Loaded, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		// 包上 os.ErrNotExist，让调用方能区分「目录不存在」与「目录读不了」。
-		return nil, fmt.Errorf("plugin: 读取插件目录 %s 失败: %w", dir, errors.Join(err, os.ErrNotExist))
+		// 不额外包 os.ErrNotExist：os.ReadDir 自己的错误已经能满足
+		// errors.Is(err, fs.ErrNotExist)，多包一层会让权限错误也变成「不存在」。
+		return nil, fmt.Errorf("plugin: 读取插件目录 %s 失败: %w", dir, err)
 	}
 	var paths []string
 	for _, entry := range entries {
@@ -297,20 +304,28 @@ func (i *Instance) Call(ctx context.Context, hook Hook, input []byte, session Se
 	if err := runtime.SetGlobal("host", i.hostGlobal(session)); err != nil {
 		return nil, false, fmt.Errorf("plugin: 注入宿主对象失败: %w", err)
 	}
+	defer runtime.ReleaseCallData()
+
+	// 计时从求值之前开始：顶层代码由插件编写，和钩子体一样可能失控。
+	timeout := i.loaded.limits.Timeout
+	timer := time.AfterFunc(timeout, func() {
+		runtime.Interrupt(errTimeout{phase: "源码求值或钩子执行", limit: timeout})
+	})
 	if err := runtime.Load(i.loaded.module); err != nil {
+		timer.Stop()
+		runtime.ClearInterrupt()
 		return nil, false, fmt.Errorf("plugin: 加载模块失败: %w", err)
 	}
-	defer runtime.ReleaseCallData()
 	argument, err := runtime.ParseJSON(input)
 	if err != nil {
+		timer.Stop()
+		runtime.ClearInterrupt()
 		return nil, false, fmt.Errorf("plugin: 解析输入失败: %w", err)
 	}
-	timer := time.AfterFunc(i.loaded.limits.Timeout, func() {
-		runtime.Interrupt(errTimeout(i.loaded.limits.Timeout))
-	})
-	defer timer.Stop()
 
 	result, callErr := runtime.Call(handle, argument)
+	// 先停表再清中断：反过来会给一个已经结束的调用留下待处理的中断。
+	timer.Stop()
 	runtime.ClearInterrupt()
 	if callErr != nil {
 		return nil, false, fmt.Errorf("plugin: %s.%s 执行失败: %w", i.Key(), hook, callErr)
@@ -375,9 +390,12 @@ func isNullish(value moejs.Value) bool {
 }
 
 // errTimeout 是超时中断的错误值。
-type errTimeout time.Duration
+type errTimeout struct {
+	phase string
+	limit time.Duration
+}
 
 // Error 实现 error。
 func (e errTimeout) Error() string {
-	return fmt.Sprintf("plugin: 钩子执行超过 %s 被中断", time.Duration(e))
+	return fmt.Sprintf("plugin: %s超过 %s 被中断", e.phase, e.limit)
 }

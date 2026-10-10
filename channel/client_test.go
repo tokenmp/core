@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -47,6 +48,17 @@ func TestSpecValidate(t *testing.T) {
 			"path",
 		},
 		{"负重试", func(s *channel.Spec) { s.MaxRetries = -1 }, "max_retries"},
+		{"重试次数过大", func(s *channel.Spec) { s.MaxRetries = 99 }, "max_retries"},
+		{
+			"基址带查询串",
+			func(s *channel.Spec) { s.BaseURL = "https://api.example.com?token=x" },
+			"查询串",
+		},
+		{
+			"请求头含换行",
+			func(s *channel.Spec) { s.Headers = map[string]string{"X-Test": "a\r\nX-Evil: 1"} },
+			"换行",
+		},
 		{"鉴权缺 key_env", func(s *channel.Spec) { s.Auth = channel.Auth{Style: "bearer"} }, "key_env"},
 		{"custom 缺 header", func(s *channel.Spec) { s.Auth = channel.Auth{Style: "custom", KeyEnv: "K"} }, "header"},
 		{"query 缺参数名", func(s *channel.Spec) { s.Auth = channel.Auth{Style: "query", KeyEnv: "K"} }, "query"},
@@ -295,6 +307,14 @@ func TestSSEWriterRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSSEReaderBoundsLineLength(t *testing.T) {
+	reader := channel.NewReader(strings.NewReader(strings.Repeat("x", 1<<20)))
+	reader.SetMaxEventBytes(1024)
+	if _, err := reader.Next(); !errors.Is(err, channel.ErrEventTooLarge) {
+		t.Fatalf("超长单行应当被拦下，实际 %v", err)
+	}
+}
+
 func TestCopyRawPreservesBytes(t *testing.T) {
 	payload := "data: {\"a\":  1}\n\ndata: [DONE]\n\n"
 	var buffer bytes.Buffer
@@ -318,6 +338,76 @@ func TestSetRejectsDuplicates(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("重名渠道应当报错")
+	}
+}
+
+func TestNonStreamingBodySurvivesSendReturn(t *testing.T) {
+	// 上游先送响应头再送体，且体大于传输层缓冲区。整体超时必须覆盖到读体，
+	// 否则 Send 一返回连接就被取消，调用方读到的是一段截断的响应。
+	payload := bytes.Repeat([]byte("x"), 256<<10)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusOK)
+		if flusher, ok := writer.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		time.Sleep(20 * time.Millisecond)
+		_, _ = writer.Write(payload)
+	}))
+	defer server.Close()
+
+	client, err := channel.NewClient(channel.Spec{
+		Name: "a", Dialect: dialect.OpenAIChat, BaseURL: server.URL, Timeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("创建客户端失败: %v", err)
+	}
+	response, err := client.Send(context.Background(), channel.Request{Body: []byte(`{}`)})
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("读响应体失败: %v", err)
+	}
+	if !bytes.Equal(body, payload) {
+		t.Fatalf("响应体不完整: 期望 %d 字节，实际 %d", len(payload), len(body))
+	}
+}
+
+func TestQueryAuthCredentialNotLeakedInError(t *testing.T) {
+	const secret = "SUPERSECRETVALUE"
+	t.Setenv("TOKENMP_TEST_KEY", secret)
+
+	// 占一个端口再放掉，保证连接一定会被拒绝。
+	listener, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("占端口失败: %v", err)
+	}
+	address := listener.Addr().String()
+	if closeErr := listener.Close(); closeErr != nil {
+		t.Fatalf("释放端口失败: %v", closeErr)
+	}
+
+	client, err := channel.NewClient(channel.Spec{
+		Name:    "a",
+		Dialect: dialect.OpenAIChat,
+		BaseURL: "http://" + address,
+		Auth:    channel.Auth{Style: channel.StyleQuery, Query: "key", KeyEnv: "TOKENMP_TEST_KEY"},
+	})
+	if err != nil {
+		t.Fatalf("创建客户端失败: %v", err)
+	}
+	response, err := client.Send(context.Background(), channel.Request{Body: []byte(`{}`)})
+	if response != nil {
+		_ = response.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("连接被拒绝时应当报错")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("错误信息里出现了凭据: %v", err)
 	}
 }
 

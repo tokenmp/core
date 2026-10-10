@@ -6,11 +6,44 @@
 package dialect
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/QuantumNous/new-api/relaykit/types"
 )
+
+// maxModelNameBytes 是写进 URL 路径的模型名上限。
+const maxModelNameBytes = 256
+
+// ValidateModelName 校验适合写进 URL 路径的模型名。
+//
+// Gemini 把模型名写在路径上，因此它必须是一段不含分隔符的名字。允许的字符是
+// 字母、数字与 . _ - 三种符号：斜杠会把模型名拆成两段路径，问号会凭空添出查询
+// 参数，百分号能绕开这段检查去构造前面两种情况。
+func ValidateModelName(model string) error {
+	if model == "" {
+		return errors.New("dialect: 模型名不能为空")
+	}
+	if len(model) > maxModelNameBytes {
+		return fmt.Errorf("dialect: 模型名超过 %d 字节", maxModelNameBytes)
+	}
+	if strings.Contains(model, "..") {
+		return fmt.Errorf("dialect: 模型名 %q 含有两个连续的点", model)
+	}
+	for _, character := range model {
+		switch {
+		case character >= 'a' && character <= 'z':
+		case character >= 'A' && character <= 'Z':
+		case character >= '0' && character <= '9':
+		case character == '.', character == '_', character == '-':
+		default:
+			return fmt.Errorf("dialect: 模型名 %q 含有不被允许的字符 %q，只允许字母、数字与 . _ -",
+				model, string(character))
+		}
+	}
+	return nil
+}
 
 // Name 是方言标识，取值即配置文件里 dialect 字段的写法。
 type Name string
@@ -116,8 +149,8 @@ func (n Name) UpstreamPath(model string, stream bool) (string, error) {
 		// 是否流式写在请求体的 stream 字段里，路径与之一致。
 		return "/v1/messages", nil
 	case GeminiGenerate:
-		if model == "" {
-			return "", fmt.Errorf("dialect: %s 的模型名写在路径上，不能为空", n)
+		if err := ValidateModelName(model); err != nil {
+			return "", err
 		}
 		if stream {
 			return "/v1beta/models/" + model + ":streamGenerateContent?alt=sse", nil

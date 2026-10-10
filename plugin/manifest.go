@@ -80,6 +80,9 @@ func (m Manifest) Validate() error {
 	if m.Key == "" {
 		return errors.New("plugin: meta.key 不能为空")
 	}
+	if m.Name == "" {
+		return errors.New("plugin: meta.name 不能为空")
+	}
 	if m.APIVersion != APIVersion {
 		return fmt.Errorf("plugin: meta.apiVersion 必须是 %q，实际是 %q", APIVersion, m.APIVersion)
 	}

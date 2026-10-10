@@ -126,6 +126,25 @@ func TestEncodeStreamEventCarriesEventName(t *testing.T) {
 	}
 }
 
+func TestValidateModelName(t *testing.T) {
+	for _, good := range []string{"gemini-2.5-pro", "gemini-2.0-flash-exp", "models_x", "a.b", "A1"} {
+		if err := dialect.ValidateModelName(good); err != nil {
+			t.Fatalf("%q 应当合法: %v", good, err)
+		}
+	}
+	for _, bad := range []string{"", "a/b", "a?b=1", "a#b", "a%2fb", "../x", "a b", "a:b", "..", strings.Repeat("x", 300)} {
+		if err := dialect.ValidateModelName(bad); err == nil {
+			t.Fatalf("%q 应当被拒绝", bad)
+		}
+	}
+	if _, err := dialect.GeminiGenerate.UpstreamPath("../../x", false); err == nil {
+		t.Fatal("写进路径的模型名必须先过校验")
+	}
+	if _, err := dialect.GeminiGenerate.UpstreamPath("gemini-2.5-pro", true); err != nil {
+		t.Fatalf("合法模型名不应报错: %v", err)
+	}
+}
+
 func TestCheckPayloadRejectsMismatch(t *testing.T) {
 	request, err := dialect.DecodeRequest(dialect.OpenAIChat, []byte(`{"model":"m"}`))
 	if err != nil {

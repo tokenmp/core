@@ -66,6 +66,10 @@ type Spec struct {
 // DefaultTimeout 是未指定超时时的取值。
 const DefaultTimeout = 120 * time.Second
 
+// MaxRetries 是重试次数的上限。转发是同步路径，重试次数乘以超时会直接变成
+// 客户端等待时长，因此这里给一个上界而不是放任配置。
+const MaxRetries = 10
+
 // ErrMissingCredential 表示凭据环境变量未设置。
 var ErrMissingCredential = errors.New("channel: 凭据环境变量未设置")
 
@@ -84,6 +88,9 @@ func (s Spec) Validate() error {
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return fmt.Errorf("channel: %s 的 base_url 必须是 http:// 或 https:// 开头", s.Name)
 	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("channel: %s 的 base_url 不能带查询串或片段，鉴权参数由 auth 配置生成", s.Name)
+	}
 	if parsed.Path != "" && parsed.Path != "/" && s.Path == "" && s.Dialect != dialect.GeminiGenerate {
 		return fmt.Errorf(
 			"channel: %s 的 base_url 带了路径 %q，此时必须显式给出 path（从该路径之后算起）",
@@ -92,8 +99,13 @@ func (s Spec) Validate() error {
 	if s.Path != "" && s.Dialect == dialect.GeminiGenerate {
 		return fmt.Errorf("channel: %s 的路径含模型名，不支持 path 覆盖", s.Name)
 	}
-	if s.MaxRetries < 0 {
-		return fmt.Errorf("channel: %s 的 max_retries 不能为负", s.Name)
+	if s.MaxRetries < 0 || s.MaxRetries > MaxRetries {
+		return fmt.Errorf("channel: %s 的 max_retries 须在 0 到 %d 之间", s.Name, MaxRetries)
+	}
+	for name, value := range s.Headers {
+		if strings.ContainsAny(name, "\r\n") || strings.ContainsAny(value, "\r\n") {
+			return fmt.Errorf("channel: %s 的请求头 %q 含换行符", s.Name, name)
+		}
 	}
 	return s.Auth.Validate()
 }

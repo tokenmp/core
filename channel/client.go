@@ -3,12 +3,14 @@ package channel
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tokenmp/core/dialect"
@@ -24,6 +26,8 @@ const (
 	idleConnTimeout  = 90 * time.Second
 	// drainLimitBytes 是丢弃响应体时最多读走的字节数，只为了让连接可复用。
 	drainLimitBytes = 1 << 16
+	// maxBackoffShift 限制退避的指数，避免移位溢出成零等待的忙重试。
+	maxBackoffShift = 6
 )
 
 // retryableStatus 是值得重试的上游状态码。
@@ -89,6 +93,10 @@ func (c *Client) Dialect() dialect.Name { return c.spec.Dialect }
 
 // Request 是一次上游调用。
 type Request struct {
+	// Dialect 覆盖渠道的默认方言，用于同一条渠道上按路由切换协议。
+	// 为空时用渠道自己的方言。覆盖生效时渠道的 Path 不参与拼接，
+	// 因为那个值是按渠道方言写的。
+	Dialect dialect.Name
 	// Method 是 HTTP 方法，为空时用 POST。
 	Method string
 	// Model 是需要写进 URL 路径的模型名，只有 Gemini 用得到。
@@ -138,19 +146,24 @@ func (c *Client) Send(ctx context.Context, req Request) (*http.Response, error) 
 }
 
 // attempt 发一次请求。
+//
+// 非流式请求的整体超时挂到响应体上，而不是在本次调用返回时取消：调用方要等
+// Send 返回之后才读响应体，在这里取消会把连接关掉，读体随即失败。
 func (c *Client) attempt(ctx context.Context, method, endpoint string, req Request) (*http.Response, error) {
 	callCtx := ctx
+	var cancel context.CancelFunc
 	if !req.Stream {
 		timeout := c.spec.Timeout
 		if timeout <= 0 {
 			timeout = DefaultTimeout
 		}
-		var cancel context.CancelFunc
 		callCtx, cancel = context.WithTimeout(ctx, timeout)
-		defer cancel()
 	}
 	request, err := http.NewRequestWithContext(callCtx, method, endpoint, bytes.NewReader(req.Body))
 	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
 		return nil, fmt.Errorf("channel: 构造上游请求失败: %w", err)
 	}
 	for key, value := range c.spec.Headers {
@@ -167,16 +180,73 @@ func (c *Client) attempt(ctx context.Context, method, endpoint string, req Reque
 	c.applyAuth(request)
 	response, err := c.http.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("channel: 请求上游失败: %w", err)
+		if cancel != nil {
+			cancel()
+		}
+		return nil, fmt.Errorf("channel: 请求上游失败: %w", redactError(err))
+	}
+	if cancel != nil {
+		response.Body = &cancelOnClose{body: response.Body, cancel: cancel}
 	}
 	return response, nil
 }
 
+// cancelOnClose 让非流式请求的超时覆盖到响应体读完为止。
+type cancelOnClose struct {
+	body   io.ReadCloser
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+// Read 透传给底层响应体。
+func (b *cancelOnClose) Read(buffer []byte) (int, error) { return b.body.Read(buffer) }
+
+// Close 关闭响应体并释放该次请求的超时计时。
+func (b *cancelOnClose) Close() error {
+	err := b.body.Close()
+	b.once.Do(b.cancel)
+	return err
+}
+
+// redactError 去掉错误信息里的查询串与用户信息。
+//
+// 查询式鉴权把凭据放在 URL 上，而 net/url 的错误会原样带上整个 URL，
+// 直接记日志或回给客户端就等于把凭据送出去。
+func redactError(err error) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		return err
+	}
+	cleaned := *urlErr
+	cleaned.URL = redactURL(urlErr.URL)
+	return &cleaned
+}
+
+// redactURL 返回去掉查询串与用户信息的地址。
+func redactURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "<上游地址>"
+	}
+	parsed.RawQuery = ""
+	parsed.ForceQuery = false
+	parsed.User = nil
+	return parsed.String()
+}
+
 // endpoint 拼出上游 URL，并把鉴权查询参数带上。
 func (c *Client) endpoint(req Request) (string, error) {
-	path := c.spec.Path
+	name := req.Dialect
+	if name == "" {
+		name = c.spec.Dialect
+	}
+	// 渠道的 path 覆盖只在方言一致时生效：那个值是按渠道方言写的。
+	path := ""
+	if name == c.spec.Dialect {
+		path = c.spec.Path
+	}
 	if path == "" {
-		resolved, err := c.spec.Dialect.UpstreamPath(req.Model, req.Stream)
+		resolved, err := name.UpstreamPath(req.Model, req.Stream)
 		if err != nil {
 			return "", err
 		}
@@ -213,6 +283,9 @@ func (c *Client) applyAuth(request *http.Request) {
 
 // sleepBackoff 按指数退避等待，context 取消时提前返回。
 func sleepBackoff(ctx context.Context, attempt int) error {
+	if attempt > maxBackoffShift {
+		attempt = maxBackoffShift
+	}
 	backoff := retryBaseBackoff << (attempt - 1)
 	if backoff > retryMaxBackoff {
 		backoff = retryMaxBackoff
