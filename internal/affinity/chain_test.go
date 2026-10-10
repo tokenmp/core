@@ -293,3 +293,50 @@ func TestChainAndTableTogether(t *testing.T) {
 		t.Fatalf("应当沿用第二轮真实使用的 account-b，实际 %q / %v", channel, ok)
 	}
 }
+
+// TestTableEvictionIsConstantTime 确认淘汰不会随着记忆条数增长而变慢。
+//
+// 按扫描找最久未用的那一版在八千条时单次淘汰要扫数百万次，实测耗时 177 毫秒，
+// 而且全程占着锁。这里给一个宽到只可能拦住数量级退化的上限，不测真实的微秒数。
+func TestTableEvictionIsConstantTime(t *testing.T) {
+	now := newClock()
+	table := NewTable(8192, time.Hour, now.Now)
+	for index := range 8192 {
+		table.Remember([]uint64{uint64(index)}, "account")
+		now.advance(time.Millisecond)
+	}
+	start := time.Now()
+	for index := range 200 {
+		table.Remember([]uint64{uint64(1_000_000 + index)}, "account")
+		now.advance(time.Millisecond)
+	}
+	elapsed := time.Since(start)
+	if elapsed > 200*time.Millisecond {
+		t.Fatalf("表满后 200 次写入耗时 %v，淘汰不是常数时间", elapsed)
+	}
+	if table.Len() > 8192 {
+		t.Fatalf("条数超过上限: %d", table.Len())
+	}
+}
+
+// TestTableSmallLimitKeepsEntries 确认很小的上限也能存下东西。
+//
+// 上一版按「删到上限的九成」淘汰，上限为 1 时目标就是 0，插入即被清空。
+func TestTableSmallLimitKeepsEntries(t *testing.T) {
+	table := NewTable(1, time.Hour, newClock().Now)
+	table.Remember([]uint64{1}, "account")
+	if table.Len() != 1 {
+		t.Fatalf("上限为 1 时应当存下一条，实际 %d 条", table.Len())
+	}
+	if channel, ok := table.Recall([]uint64{1}); !ok || channel != "account" {
+		t.Fatalf("应当查得回来，实际 %q / %v", channel, ok)
+	}
+	// 再来一条，会把上一条挤掉。
+	table.Remember([]uint64{2}, "account")
+	if table.Len() != 1 {
+		t.Fatalf("上限为 1 时挤掉旧的之后仍应只有一条，实际 %d 条", table.Len())
+	}
+	if _, ok := table.Recall([]uint64{1}); ok {
+		t.Fatal("被挤掉的那条不应当还在")
+	}
+}

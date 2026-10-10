@@ -37,6 +37,13 @@ func EntriesOf(name Name, body []byte) ([][]byte, error) {
 	}
 }
 
+// 条目里反复用到的字段名。
+const (
+	itemTypeKey = "type"
+	roleKey     = "role"
+	contentKey  = "content"
+)
+
 // headEntry 把工具定义与系统提示合成序列的第一个条目。
 //
 // 四种方言把系统提示放在不同位置：Chat 与 Responses 是条目数组里的一条，Claude
@@ -71,6 +78,7 @@ func chatEntries(request *dto.GeneralOpenAIRequest) ([][]byte, error) {
 		return nil, err
 	}
 	for _, message := range conversation {
+		message.Content = normalizeContent(message.Content, "text")
 		if entries, err = appendEntry(entries, message); err != nil {
 			return nil, err
 		}
@@ -80,11 +88,12 @@ func chatEntries(request *dto.GeneralOpenAIRequest) ([][]byte, error) {
 
 // claudeEntries 切分 Claude Messages 的条目。
 func claudeEntries(request *dto.ClaudeRequest) ([][]byte, error) {
-	entries, err := startEntries(headEntry(request.Tools, request.System))
+	entries, err := startEntries(headEntry(request.Tools, normalizeContent(request.System, "text")))
 	if err != nil {
 		return nil, err
 	}
 	for _, message := range request.Messages {
+		message.Content = normalizeContent(message.Content, "text")
 		if entries, err = appendEntry(entries, message); err != nil {
 			return nil, err
 		}
@@ -122,7 +131,7 @@ func responsesEntries(request *dto.OpenAIResponsesRequest) ([][]byte, error) {
 	system := make([]any, 0, len(items))
 	conversation := make([]any, 0, len(items))
 	for _, item := range items {
-		canonical, canonicalErr := canonicalValue(item)
+		canonical, canonicalErr := canonicalValue(normalizeResponsesItem(item))
 		if canonicalErr != nil {
 			return nil, canonicalErr
 		}
@@ -170,20 +179,9 @@ func responsesItems(input json.RawMessage) ([]json.RawMessage, error) {
 		if err := json.Unmarshal(trimmed, &text); err != nil {
 			return nil, fmt.Errorf("dialect: 解析 Responses 的 input 失败: %w", err)
 		}
-		item, err := json.Marshal(struct {
-			Type    string `json:"type"`
-			Role    string `json:"role"`
-			Content []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-		}{
-			Type: "message",
-			Role: "user",
-			Content: []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			}{{Type: "input_text", Text: text}},
+		// 造成与数组写法同形的消息条目，后面的归一化会把两者收敛到一起。
+		item, err := json.Marshal(map[string]any{
+			itemTypeKey: responsesMessageItemType, roleKey: "user", contentKey: text,
 		})
 		if err != nil {
 			return nil, err
@@ -226,6 +224,63 @@ func canonicalValue(raw json.RawMessage) (any, error) {
 		return nil, fmt.Errorf("dialect: 规范化条目失败: %w", err)
 	}
 	return value, nil
+}
+
+// normalizeContent 把写成纯字符串的内容收敛成单块数组。
+//
+// 多模态内容允许写成纯字符串，也允许写成只含一个文本块的数组，两种写法表达同一
+// 段内容。不归一的话客户端从一种换成另一种时指纹就变了，前缀链认不出这是同一段
+// 历史。textType 是该方言的文本块类型名。
+func normalizeContent(value any, textType string) any {
+	text, ok := value.(string)
+	if !ok {
+		return value
+	}
+	return []any{map[string]any{"type": textType, "text": text}}
+}
+
+// responsesMessageItemType 是 Responses 里消息条目的类型名。
+const responsesMessageItemType = "message"
+
+// normalizeResponsesItem 把消息条目里写成纯字符串的 content 展开成内容块数组。
+//
+// 块类型按角色取：助手回合是 output_text，其余是 input_text，与规范的写法一致。
+//
+// 读不出结构时原样返回。这个函数只服务于指纹，不是校验器：请求体的合法性由
+// DecodeRequest 负责，这里认不出来的形状交给后面的规范化处理即可，报错反而会让
+// 一次亲和计算失败升级成一次转发失败。
+func normalizeResponsesItem(item json.RawMessage) json.RawMessage {
+	var probe struct {
+		Type    string          `json:"type"`
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(item, &probe) != nil {
+		return item
+	}
+	if probe.Type != responsesMessageItemType || len(probe.Content) == 0 || probe.Content[0] != '"' {
+		return item
+	}
+	var text string
+	if json.Unmarshal(probe.Content, &text) != nil {
+		return item
+	}
+	decoder := json.NewDecoder(bytes.NewReader(item))
+	decoder.UseNumber()
+	var fields map[string]any
+	if decoder.Decode(&fields) != nil {
+		return item
+	}
+	blockType := "input_text"
+	if role, _ := fields["role"].(string); role == "assistant" {
+		blockType = "output_text"
+	}
+	fields["content"] = []any{map[string]any{"type": blockType, "text": text}}
+	// 这里只装着字符串，编码不会失败。
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		return item
+	}
+	return encoded
 }
 
 // isSystemRole 报告角色名是否属于系统提示。

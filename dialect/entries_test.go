@@ -2,6 +2,7 @@ package dialect_test
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/tokenmp/core/dialect"
@@ -194,21 +195,142 @@ func TestEntriesCountParallelToolRound(t *testing.T) {
 	}
 }
 
-// TestEntriesAlwaysStartWithHead 确认头条目总是第一个，且带着工具与系统提示。
-func TestEntriesAlwaysStartWithHead(t *testing.T) {
-	for _, pair := range toolTurnPairs {
-		name := dialect.Name(pair.name)
-		entries, err := dialect.EntriesOf(name, []byte(pair.next))
+// toolHeadBodies 在四种方言里都声明同一个工具，用来确认工具被收进头条目。
+var toolHeadBodies = map[dialect.Name]string{
+	dialect.OpenAIChat: `{"model":"m","tools":[{"type":"function","function":{"name":"查天气"}}],
+		"messages":[{"role":"system","content":"sys"},{"role":"user","content":"一"}]}`,
+	dialect.OpenAIResponses: `{"model":"m","instructions":"sys","tools":[{"type":"function","name":"查天气"}],
+		"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"一"}]}]}`,
+	dialect.ClaudeMessages: `{"model":"m","max_tokens":9,"system":"sys","tools":[{"name":"查天气"}],
+		"messages":[{"role":"user","content":"一"}]}`,
+	dialect.GeminiGenerate: `{"systemInstruction":{"parts":[{"text":"sys"}]},
+		"tools":[{"functionDeclarations":[{"name":"查天气"}]}],
+		"contents":[{"role":"user","parts":[{"text":"一"}]}]}`,
+}
+
+// TestEntriesPutToolsAndSystemInHead 确认工具定义与系统提示都进了第一个条目。
+//
+// 四种方言把这二者放在不同位置，统一收进头条目之后，序列结构才在四种方言下一致，
+// 也才只因为「客户端改了工具或系统提示」而分叉。
+//
+// 断言要写出具体的工具名，不能只查是否存在 tools 这个键：头条目是个固定结构，
+// 没有工具时那个键也在，值为 null，那样的断言恒真。
+func TestEntriesPutToolsAndSystemInHead(t *testing.T) {
+	for name, body := range toolHeadBodies {
+		entries, err := dialect.EntriesOf(name, []byte(body))
 		if err != nil {
 			t.Fatalf("%s 切分失败: %v", name, err)
 		}
 		head := string(entries[0])
-		if !bytes.Contains([]byte(head), []byte("tools")) {
-			t.Fatalf("%s 的头条目里没有 tools: %s", name, head)
+		if !strings.Contains(head, "查天气") {
+			t.Fatalf("%s 的头条目里没有工具名: %s", name, head)
 		}
-		if !bytes.Contains([]byte(head), []byte("sys")) {
+		if !strings.Contains(head, "sys") {
 			t.Fatalf("%s 的头条目里没有系统提示: %s", name, head)
 		}
+		if len(entries) < 2 {
+			t.Fatalf("%s 应当还有一个对话条目", name)
+		}
+		if strings.Contains(string(entries[1]), "查天气") {
+			t.Fatalf("%s 的工具名不该出现在对话条目里: %s", name, entries[1])
+		}
+	}
+}
+
+// TestEntriesNoToolsStillHasHead 确认没有工具时头条目仍然存在，只是值为空。
+func TestEntriesNoToolsStillHasHead(t *testing.T) {
+	entries, err := dialect.EntriesOf(dialect.OpenAIChat,
+		[]byte(`{"model":"m","messages":[{"role":"user","content":"一"}]}`))
+	if err != nil {
+		t.Fatalf("切分失败: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("应当有一个头条目加一条对话，实际 %d 条", len(entries))
+	}
+	if !strings.Contains(string(entries[0]), `"tools":null`) {
+		t.Fatalf("没有工具时头条目的 tools 应当是 null: %s", entries[0])
+	}
+}
+
+// TestEntriesNormalizeEquivalentSpellings 确认同一段内容的两种写法算同一段条目。
+//
+// 多模态内容既允许写成纯字符串，也允许写成只含一个文本块的数组；Responses 的
+// input 还允许整段写成纯字符串。这些写法表达同一段内容，不归一的话客户端换一种
+// 写法前缀就断了，前缀链永远查不中。
+func TestEntriesNormalizeEquivalentSpellings(t *testing.T) {
+	cases := []struct {
+		name     string
+		dialect  dialect.Name
+		spelling [2]string
+	}{
+		{
+			name:    "openai 消息内容",
+			dialect: dialect.OpenAIChat,
+			spelling: [2]string{
+				`{"model":"m","messages":[{"role":"user","content":"一"}]}`,
+				`{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"一"}]}]}`,
+			},
+		},
+		{
+			name:    "claude 系统提示",
+			dialect: dialect.ClaudeMessages,
+			spelling: [2]string{
+				`{"model":"m","max_tokens":9,"system":"sys","messages":[{"role":"user","content":"一"}]}`,
+				`{"model":"m","max_tokens":9,"system":[{"type":"text","text":"sys"}],"messages":[{"role":"user","content":"一"}]}`,
+			},
+		},
+		{
+			name:    "claude 消息内容",
+			dialect: dialect.ClaudeMessages,
+			spelling: [2]string{
+				`{"model":"m","max_tokens":9,"messages":[{"role":"user","content":"一"}]}`,
+				`{"model":"m","max_tokens":9,"messages":[{"role":"user","content":[{"type":"text","text":"一"}]}]}`,
+			},
+		},
+		{
+			name:    "responses 整段简写",
+			dialect: dialect.OpenAIResponses,
+			spelling: [2]string{
+				`{"model":"m","input":"一"}`,
+				`{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"一"}]}]}`,
+			},
+		},
+		{
+			name:    "responses 消息内容",
+			dialect: dialect.OpenAIResponses,
+			spelling: [2]string{
+				`{"model":"m","input":[{"type":"message","role":"user","content":"一"}]}`,
+				`{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"一"}]}]}`,
+			},
+		},
+		{
+			name:    "responses 助手消息内容",
+			dialect: dialect.OpenAIResponses,
+			spelling: [2]string{
+				`{"model":"m","input":[{"type":"message","role":"assistant","content":"一"}]}`,
+				`{"model":"m","input":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"一"}]}]}`,
+			},
+		},
+	}
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			first, err := dialect.EntriesOf(item.dialect, []byte(item.spelling[0]))
+			if err != nil {
+				t.Fatalf("第一种写法切分失败: %v", err)
+			}
+			second, err := dialect.EntriesOf(item.dialect, []byte(item.spelling[1]))
+			if err != nil {
+				t.Fatalf("第二种写法切分失败: %v", err)
+			}
+			if len(first) != len(second) {
+				t.Fatalf("条目数不同: %d 与 %d", len(first), len(second))
+			}
+			for index := range first {
+				if !bytes.Equal(first[index], second[index]) {
+					t.Fatalf("第 %d 个条目对不上:\n%s\n%s", index, first[index], second[index])
+				}
+			}
+		})
 	}
 }
 

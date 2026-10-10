@@ -82,6 +82,25 @@ func chainBody(turns int) string {
 	return `{"model":"client-model","messages":[` + strings.Join(messages, ",") + `]}`
 }
 
+// seededChainBody 造一段带 seed 的多轮会话，seed 让不同的会话互不相同。
+func seededChainBody(seed string, turns int) string {
+	messages := []string{`{"role":"system","content":"` + longSystemPrompt + seed + `"}`}
+	for turn := 1; turn <= turns; turn++ {
+		messages = append(messages, fmt.Sprintf(`{"role":"user","content":"第%d问"}`, turn))
+		if turn < turns {
+			messages = append(messages, fmt.Sprintf(`{"role":"assistant","content":"第%d答"}`, turn))
+		}
+	}
+	return `{"model":"client-model","messages":[` + strings.Join(messages, ",") + `]}`
+}
+
+// postStatus 发一次请求，只返回状态码。
+func postStatus(t *testing.T, front *httptest.Server, body string) int {
+	t.Helper()
+	status, _ := postWith(t, front.URL+"/v1/chat/completions", "", body)
+	return status
+}
+
 // chainBodyWith 造一段单轮的会话，seed 让不同的会话互不相同。
 //
 // 与 chainBody 的区别在用途：chainBody 的几轮属于同一段会话，会互相粘住；
@@ -394,15 +413,62 @@ func TestAffinityChainFollowsActualChannel(t *testing.T) {
 	}
 }
 
-// TestAffinityChainRespectsTableSizeZero 确认把记忆关掉时前缀链不起作用。
+// TestAffinityChainRespectsTableSizeZero 确认把记忆关掉时前缀链不再起作用。
+//
+// 做成差分：默认配置下一段会话的后续轮次都粘住，关掉记忆后没有东西可查，每一轮
+// 按各自内容重新分配。只断言「不报错」那种写法，table_size 根本没接上也照样通过。
 func TestAffinityChainRespectsTableSizeZero(t *testing.T) {
-	front, _ := newChannelServer(t,
+	enabled, _ := newChannelServer(t,
+		[]channelSpec{{name: "first"}, {name: "second"}},
+		affinityModels("pool"))
+	settled := served(t, enabled, "", chainBody(1))
+	for turn := 2; turn <= 16; turn++ {
+		if got := served(t, enabled, "", chainBody(turn)); got != settled {
+			t.Fatalf("默认配置下第 %d 轮应当粘住 %s，实际 %s", turn, settled, got)
+		}
+	}
+
+	disabled, _ := newChannelServer(t,
 		[]channelSpec{{name: "first"}, {name: "second"}},
 		"affinity:\n  table_size: 0\n"+affinityModels("pool"))
+	seen := map[string]bool{}
+	for turn := 1; turn <= 16; turn++ {
+		seen[served(t, disabled, "", chainBody(turn))] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("关掉记忆后十六轮仍只走一条渠道 %v，说明 table_size 没有接上", seen)
+	}
+}
 
-	// 记忆关掉之后没有任何东西可查，每一轮都按各自内容分配。
-	// 这里只要求不报错且请求都能服务成功，分配结果不作断言。
-	for turn := 1; turn <= 3; turn++ {
-		served(t, front, "", chainBody(turn))
+// TestAffinityChainDoesNotRememberFailedChannel 确认失败响应不会被记成渠道。
+//
+// 400 说明请求本身有问题，上游没有写下任何缓存。把它记下来会让这段会话之后每一轮
+// 都先撞同一条坏渠道，永远走不到另一条。
+func TestAffinityChainDoesNotRememberFailedChannel(t *testing.T) {
+	front, records := newChannelServer(t,
+		[]channelSpec{{name: "first", status: http.StatusBadRequest}, {name: "second"}},
+		affinityModels("pool"))
+
+	// 找一个冷启动会选中 first 的会话，也就是第一轮必定 400 的那种。
+	seed := ""
+	for index := range 40 {
+		candidate := fmt.Sprintf("变体%d", index)
+		if postStatus(t, front, seededChainBody(candidate, 1)) == http.StatusBadRequest {
+			seed = candidate
+			break
+		}
+	}
+	if seed == "" {
+		t.Fatal("找不到冷启动会选中报错渠道的会话，这个测试失去了意义")
+	}
+	succeeded := 0
+	for turn := 2; turn <= 16; turn++ {
+		if postStatus(t, front, seededChainBody(seed, turn)) == http.StatusOK {
+			succeeded++
+		}
+	}
+	if succeeded == 0 {
+		t.Fatalf("十五轮全部失败，说明第一轮的失败被记成了渠道（first 共被调用 %d 次）",
+			records["first"].count())
 	}
 }

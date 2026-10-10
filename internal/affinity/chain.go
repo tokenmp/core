@@ -45,12 +45,29 @@ func PrefixBytes(entries [][]byte) int {
 	return total
 }
 
-// 淘汰后回落到的比例。留出余量是为了不必每次插入都做一次全表扫描：回落到九成
-// 之后，要再插进一成才会触发下一次淘汰。
-const (
-	evictNumerator   = 9
-	evictDenominator = 10
-)
+// Table 记住「请求前缀的指纹 → 渠道」的对应关系，供没有会话标识的客户端兜底。
+//
+// 键是内容指纹而不是会话名，因此两段内容完全相同的前缀会共用一条记忆。这不是
+// 缺陷：内容相同就意味着上游那份缓存真的可以共享。
+//
+// 淘汰按插入顺序，不按最近使用。这里需要的是「上限之内保留各段会话最近若干轮的
+// 指纹」，而活跃会话每一轮都写一条新记忆，上一轮那条只有一轮的岁数，挤不掉。
+// 做成最近最少使用要额外维护一个堆，收益不足以抵消复杂度。
+//
+// Table 可以并发使用。limit 不大于零时整个记忆关闭，Recall 一律不命中。
+type Table struct {
+	mu      sync.Mutex
+	records map[uint64]record
+	// ring 按插入顺序记下还在表里的键，写满之后覆盖最旧的一格。
+	//
+	// 有了它淘汰是常数时间。按扫描找最久未用的那一版在上限八千时单次要扫数百万
+	// 次，而且全程占着锁，实测一次淘汰耗时 177 毫秒，等于让全部并发请求停住。
+	ring  []uint64
+	next  int
+	limit int
+	ttl   time.Duration
+	now   func() time.Time
+}
 
 // record 是一次记忆。
 type record struct {
@@ -58,31 +75,21 @@ type record struct {
 	usedAt  time.Time
 }
 
-// Table 记住「请求前缀的指纹 → 渠道」的对应关系，供没有会话标识的客户端兜底。
-//
-// 键是内容指纹而不是会话名，因此两段内容完全相同的前缀会共用一条记忆。这不是
-// 缺陷：内容相同就意味着上游那份缓存真的可以共享。
-//
-// Table 可以并发使用。limit 不大于零时整个记忆关闭，Recall 一律不命中。
-type Table struct {
-	mu      sync.Mutex
-	records map[uint64]record
-	limit   int
-	ttl     time.Duration
-	now     func() time.Time
-}
-
 // NewTable 创建记忆表。ttl 为上游缓存的寿命，命中与写入都会续期。
 func NewTable(limit int, ttl time.Duration, now func() time.Time) *Table {
 	if now == nil {
 		now = time.Now
 	}
-	return &Table{
+	table := &Table{
 		records: make(map[uint64]record, max(limit, 0)),
 		limit:   limit,
 		ttl:     ttl,
 		now:     now,
 	}
+	if limit > 0 {
+		table.ring = make([]uint64, 0, limit)
+	}
+	return table
 }
 
 // Recall 从链的末尾往回找第一条还活着的记忆，返回它记下的渠道。
@@ -102,7 +109,8 @@ func (t *Table) Recall(chain []uint64) (string, bool) {
 			continue
 		}
 		if now.Sub(found.usedAt) > t.ttl {
-			// 过期的那一条直接删掉，不必等淘汰时才清。
+			// 过期的那一条直接删掉，不必等淘汰时才清。它在环里占的那一格等被
+			// 覆盖时再删一次，删不存在的键是无操作。
 			delete(t.records, chain[index])
 			continue
 		}
@@ -122,8 +130,17 @@ func (t *Table) Remember(chain []uint64, channel string) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.records[chain[len(chain)-1]] = record{channel: channel, usedAt: t.now()}
-	t.evictLocked()
+	key := chain[len(chain)-1]
+	if _, exists := t.records[key]; !exists {
+		if len(t.ring) < t.limit {
+			t.ring = append(t.ring, key)
+		} else {
+			delete(t.records, t.ring[t.next])
+			t.ring[t.next] = key
+			t.next = (t.next + 1) % t.limit
+		}
+	}
+	t.records[key] = record{channel: channel, usedAt: t.now()}
 }
 
 // Len 返回当前的记忆条数。
@@ -134,35 +151,4 @@ func (t *Table) Len() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return len(t.records)
-}
-
-// evictLocked 把条数压回上限以内。调用方须持有锁。
-//
-// 先清过期的，还不够就按最久未用删到上限的九成。留出那一成是为了不必每次插入都
-// 做一次全表扫描。
-func (t *Table) evictLocked() {
-	if len(t.records) <= t.limit {
-		return
-	}
-	now := t.now()
-	for key, item := range t.records {
-		if now.Sub(item.usedAt) > t.ttl {
-			delete(t.records, key)
-		}
-	}
-	target := t.limit * evictNumerator / evictDenominator
-	for len(t.records) > target {
-		var oldestKey uint64
-		var oldestAt time.Time
-		first := true
-		for key, item := range t.records {
-			if first || item.usedAt.Before(oldestAt) {
-				oldestKey, oldestAt, first = key, item.usedAt, false
-			}
-		}
-		if first {
-			return
-		}
-		delete(t.records, oldestKey)
-	}
 }

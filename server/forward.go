@@ -61,12 +61,15 @@ func (s *Server) forward(writer http.ResponseWriter, request *http.Request, clie
 	if response == nil {
 		return
 	}
-	if len(plan.chain) > 0 {
+	defer func() { _ = response.Body.Close() }()
+	if len(plan.chain) > 0 && response.StatusCode < http.StatusBadRequest {
 		// 记下真实服务的那条渠道，而不是选定的那条：降级换过渠道之后，下一轮
 		// 应当沿用的是缓存实际写在哪。
+		//
+		// 失败响应不记。上游返回 400、404、422 说明请求本身有问题，它没有写下
+		// 任何缓存，记下来只会让这段会话之后每一轮都先撞同一条坏渠道。
 		s.affinityTable.Remember(plan.chain, route.Channel)
 	}
-	defer func() { _ = response.Body.Close() }()
 	s.writeUpstream(writer, request, client, model, route, prepared, response)
 }
 
