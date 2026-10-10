@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // TestAccessWriterForwardsFlush 覆盖最容易踩的一处：包装层吃掉 Flush 会让流式响应
@@ -83,6 +84,46 @@ func TestAccessMiddlewareLogsArrivalBeforeHandlerReturns(t *testing.T) {
 	<-done
 	if text := logs.String(); !strings.Contains(text, `"msg":"请求完成"`) {
 		t.Fatalf("处理器返回后应当写出完成行: %s", text)
+	}
+}
+
+// TestClipLogValue 覆盖日志字段的截断。
+//
+// 这些值来自请求，别处约束不了它们：请求体上限是 32 MiB，请求头走 Go 默认的 1 MiB
+// （Server 没有设 MaxHeaderBytes），而同一个值在进入行与完成行里各写一次。
+func TestClipLogValue(t *testing.T) {
+	// 保留前缀的长度是上限减去省略号 —— 省略号算在上限之内。
+	prefix := maxLogValueBytes - len(logValueEllipsis)
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "空串原样", in: "", want: ""},
+		{name: "短的不动", in: "curl/8.5.0", want: "curl/8.5.0"},
+		{name: "恰好到上限不动", in: strings.Repeat("a", maxLogValueBytes), want: strings.Repeat("a", maxLogValueBytes)},
+		{name: "超一个字节就截", in: strings.Repeat("a", maxLogValueBytes+1), want: strings.Repeat("a", prefix) + logValueEllipsis},
+		// 「中」占三个字节且跨在保留前缀的末尾上，应当回退到字符边界，而不是切出半个字符。
+		{name: "截断点落在多字节字符中间时回退", in: strings.Repeat("a", prefix-1) + "中" + strings.Repeat("a", 10), want: strings.Repeat("a", prefix-1) + logValueEllipsis},
+		// 请求头里允许出现非法 UTF-8（Go 的解析不校验）。这种输入截断后仍会带着非法字节，
+		// 这里只要求不 panic、不超过上限，输出交给 slog 转义。
+		{name: "非法 UTF-8 原样留在前缀里", in: strings.Repeat("a", 100) + "\xff" + strings.Repeat("a", 300), want: strings.Repeat("a", 100) + "\xff" + strings.Repeat("a", prefix-101) + logValueEllipsis},
+		{name: "全是 continuation 字节时退到只剩标记", in: strings.Repeat("\x80", 400), want: logValueEllipsis},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := clipLogValue(testCase.in)
+			if got != testCase.want {
+				t.Fatalf("截断结果不符：期望 %q，实际 %q", testCase.want, got)
+			}
+			if len(got) > maxLogValueBytes {
+				t.Fatalf("截断之后超过上限：%d 字节", len(got))
+			}
+			// 输入本身合法时，回退必须保证输出也合法。
+			if utf8.ValidString(testCase.in) && !utf8.ValidString(got) {
+				t.Fatalf("合法输入截出了非法 UTF-8: %q", got)
+			}
+		})
 	}
 }
 

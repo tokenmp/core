@@ -281,6 +281,116 @@ models:
 	}
 }
 
+// TestAccessLogReportsUserAgent 覆盖客户端标识：两行都带 user_agent。
+//
+// 默认只听 127.0.0.1 时 client 恒为 127.0.0.1，认不出是谁在调用，user_agent 补上这一点。
+func TestAccessLogReportsUserAgent(t *testing.T) {
+	front, logs := newLoggingServer(t, `
+channels:
+  - {name: upstream, dialect: openai, base_url: "https://example.com"}
+models:
+  - {match: "client-model", channel: upstream}
+`)
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, front.URL+"/healthz", nil)
+	if err != nil {
+		t.Fatalf("构造请求失败: %v", err)
+	}
+	request.Header.Set("User-Agent", "claude-cli/2.1.287 (external, cli)")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	_ = response.Body.Close()
+
+	lines := waitForLog(t, logs, "请求完成", 1)
+	for _, msg := range []string{"请求进入", "请求完成"} {
+		assertField(t, onlyLine(t, lines, msg), "user_agent", "claude-cli/2.1.287 (external, cli)")
+	}
+}
+
+// TestAccessLogReportsEmptyUserAgent 覆盖客户端不发这个请求头：字段留空串，
+// 读日志的人不用去分辨「没这个键」与「值为空」。
+func TestAccessLogReportsEmptyUserAgent(t *testing.T) {
+	front, logs := newLoggingServer(t, `
+channels:
+  - {name: upstream, dialect: openai, base_url: "https://example.com"}
+models:
+  - {match: "client-model", channel: upstream}
+`)
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, front.URL+"/healthz", nil)
+	if err != nil {
+		t.Fatalf("构造请求失败: %v", err)
+	}
+	// 显式置空，压掉 Go 客户端自带的默认 User-Agent。
+	request.Header.Set("User-Agent", "")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	_ = response.Body.Close()
+
+	lines := waitForLog(t, logs, "请求完成", 1)
+	for _, msg := range []string{"请求进入", "请求完成"} {
+		assertField(t, onlyLine(t, lines, msg), "user_agent", "")
+	}
+}
+
+// assertClipped 断言一个字段被截到文档写明的 256 字节之内，并以省略号结尾。
+//
+// 断言消息只报长度，不打值：被截断之前的值有 64 KiB 量级，打进失败输出就没法看了。
+func assertClipped(t *testing.T, line map[string]any, field string) {
+	t.Helper()
+	value := stringField(t, line, field)
+	if len(value) > 256 {
+		t.Fatalf("%s 没有被截到上限内：%d 字节", field, len(value))
+	}
+	if !strings.HasSuffix(value, "…") {
+		t.Fatalf("%s 应当以省略号结尾，实际 %d 字节且末尾不是省略号", field, len(value))
+	}
+}
+
+// TestAccessLogClipsRequestValues 覆盖截断在真实路径上生效：客户端用超长的模型名与
+// 超长的路径，两行日志都不该被它撑大。
+//
+// 模型名来自请求体（上限 32 MiB），路径来自请求行（与请求头共用 Go 默认的 1 MiB），
+// 而同一个值在进入行与完成行里各写一次。
+func TestAccessLogClipsRequestValues(t *testing.T) {
+	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, openAIChatResponse)
+	})
+	front, logs := newLoggingServer(t, `
+channels:
+  - {name: upstream, dialect: openai, base_url: "`+upstreamServer.URL+`"}
+models:
+  - {match: "client-*", channel: upstream}
+`)
+
+	longModel := "client-" + strings.Repeat("m", 1<<16)
+	status, _, body := post(t, front.URL+"/v1/chat/completions",
+		`{"model":"`+longModel+`","messages":[{"role":"user","content":"你好"}]}`)
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d %s", status, body)
+	}
+	response, err := get(t, front.URL+"/"+strings.Repeat("p", 1<<16))
+	if err != nil {
+		t.Fatalf("请求超长路径失败: %v", err)
+	}
+	_ = response.Body.Close()
+
+	lines := waitForLog(t, logs, "请求完成", 2)
+	for _, line := range lines {
+		for _, field := range []string{"method", "path", "user_agent"} {
+			if got := len(stringField(t, line, field)); got > 256 {
+				t.Fatalf("%s 没有被截断：%d 字节", field, got)
+			}
+		}
+	}
+
+	completed := completedLines(t, lines)
+	assertClipped(t, lineWith(t, completed, "status", float64(http.StatusOK)), "model")
+	assertClipped(t, lineWith(t, completed, "status", float64(http.StatusNotFound)), "path")
+}
+
 // TestStreamingAccessLogKeepsFlusher 覆盖流式路径：请求完成后留一行，并且包装层
 // 必须把 http.Flusher 透传出去。
 //
