@@ -65,7 +65,7 @@ plugins:
 | --- | --- | --- |
 | `listen` | `127.0.0.1:8787` | 监听地址 |
 | `log.format` | `json` | 日志格式 |
-| `log.level` | `info` | 日志级别 |
+| `log.level` | `info` | 日志级别，同时控制访问日志 |
 | `channels[].timeout` | `120s` | 单次上游请求的整体超时 |
 | `channels[].max_retries` | `0` | 失败后的重试次数 |
 | `channels[].path` | 按方言 | 覆盖上游路径 |
@@ -92,6 +92,26 @@ plugins:
 `base_url` 已经带路径时（比如 `https://openrouter.ai/api/v1`）必须显式给出
 `path`，取值从该路径之后算起，否则校验失败。
 Gemini 的路径含模型名，不支持覆盖。
+
+## 访问日志
+
+每个进入服务的请求都会在完成时留一行，与两端方言是否相同、上游有没有给出用量无关。
+
+级别口径按状态码定，默认的 `log.level` 是 `info`。状态码小于 400 记 INFO，
+因此服务一跑起来就能看见每个请求，包括客户端与渠道同方言的透传这条最常见的路径；
+状态码 400 及以上记 WARN，与既有的失败日志同级，一起由 `log.level` 控制。
+
+失败路径上原有的 WARN 行保留，与完成行共享同一个 `request_id`，一次请求的几条日志靠它串起来。
+
+字段有 `request_id`、`method`、`path`、`status`、`duration`、
+`model`、`channel`、`attempts`、`client`。跨方言转发且上游给出用量时另有
+`prompt_tokens`、`completion_tokens`、`total_tokens`，有缓存命中时加
+`cached_tokens`；同方言透传不解析用量，这一行也就没有 token 字段。
+
+`client` 是去掉端口之后的客户端地址，`attempts` 是这条请求试过的候选条数，
+转换失败与连接失败都算一次，`model` 是插件改写之后的模型名。
+
+`duration` 是 slog 的时长属性：`text` 格式下形如 `12.3ms`，`json` 下是纳秒整数。
 
 ## 校验
 

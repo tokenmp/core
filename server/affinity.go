@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
@@ -46,10 +47,11 @@ func (s *Server) planAffinity(
 		// 规则写了组名」回到什么都不做的保守行为。
 		return affinityPlan{routes: routes}
 	}
+	ctx := request.Context()
 
 	// 显式标识优先。它与方言无关，Claude 与 Gemini 的客户端只能靠它。
 	if key := explicitSessionKey(request, client, body); key != "" {
-		return affinityPlan{routes: s.orderByHash(key, pool, routes)}
+		return affinityPlan{routes: s.orderByHash(ctx, key, pool, routes)}
 	}
 
 	// 没有标识时靠请求内容认出上一轮发过的前缀。
@@ -71,7 +73,7 @@ func (s *Server) planAffinity(
 	}
 	// 冷启动：按这一轮的内容先定一条，下一轮靠这条链查回来。
 	return affinityPlan{
-		routes: s.orderByHash(strconv.FormatUint(chain[len(chain)-1], 16), pool, routes),
+		routes: s.orderByHash(ctx, strconv.FormatUint(chain[len(chain)-1], 16), pool, routes),
 		chain:  chain,
 	}
 }
@@ -88,14 +90,14 @@ func explicitSessionKey(request *http.Request, client dialect.Name, body []byte)
 }
 
 // orderByHash 按 rendezvous 哈希给池内候选定序，池外的候选跟在后面。
-func (s *Server) orderByHash(key string, pool []int, routes []config.Route) []config.Route {
+func (s *Server) orderByHash(ctx context.Context, key string, pool []int, routes []config.Route) []config.Route {
 	identities := make([]string, len(pool))
 	for position, index := range pool {
 		identities[position] = routeIdentity(routes[index])
 	}
 	order := affinity.Order(key, identities)
 	reordered := orderPool(order, pool, routes)
-	s.logAffinityChange(key, reordered, routes)
+	s.logAffinityChange(ctx, key, reordered, routes)
 	return reordered
 }
 
@@ -140,7 +142,7 @@ func orderPool(order []int, pool []int, routes []config.Route) []config.Route {
 }
 
 // logAffinityChange 在亲和改变了首选渠道时记一条调试日志。
-func (s *Server) logAffinityChange(key string, reordered, original []config.Route) {
+func (s *Server) logAffinityChange(ctx context.Context, key string, reordered, original []config.Route) {
 	if len(reordered) == 0 || len(original) == 0 {
 		return
 	}
@@ -148,6 +150,7 @@ func (s *Server) logAffinityChange(key string, reordered, original []config.Rout
 		return
 	}
 	s.logger.Debug("会话亲和改选了渠道",
+		"request_id", requestIDOf(ctx),
 		"session", maskSession(key),
 		"sticky", routeOf(reordered[0]),
 		"configured", routeOf(original[0]))

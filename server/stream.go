@@ -37,8 +37,8 @@ func (s *Server) writeStream(
 			IncludeUsage: true,
 		})
 		if err != nil {
-			s.logger.Warn("创建流式转换会话失败", "error", err.Error())
-			s.writeError(writer, http.StatusBadGateway, "conversion_error", err.Error())
+			s.logger.Warn("创建流式转换会话失败", "request_id", requestIDOf(ctx), "error", err.Error())
+			s.writeError(ctx, writer, http.StatusBadGateway, "conversion_error", err.Error())
 			return
 		}
 		session = created
@@ -76,7 +76,7 @@ func (s *Server) pipeStream(
 			}
 		}
 		if _, err := channel.CopyRaw(writer, response.Body, flush); err != nil {
-			s.logger.Warn("转发上游流失败", "error", err.Error())
+			s.logger.Warn("转发上游流失败", "request_id", requestIDOf(ctx), "error", err.Error())
 		}
 		return
 	}
@@ -87,18 +87,18 @@ func (s *Server) pipeStream(
 			return
 		}
 		if err != nil {
-			s.logger.Warn("读取上游流失败", "error", err.Error())
+			s.logger.Warn("读取上游流失败", "request_id", requestIDOf(ctx), "error", err.Error())
 			return
 		}
 		if dialect.IsDoneMarker(event.Data) {
 			if err := out.WriteRaw(event.Data); err != nil {
-				s.logger.Warn("写出结束标记失败", "error", err.Error())
+				s.logger.Warn("写出结束标记失败", "request_id", requestIDOf(ctx), "error", err.Error())
 				return
 			}
 			continue
 		}
 		if err := s.emitEvent(ctx, client, model, event.Name, event.Data, out); err != nil {
-			s.logger.Warn("写出流式事件失败", "error", err.Error())
+			s.logger.Warn("写出流式事件失败", "request_id", requestIDOf(ctx), "error", err.Error())
 			return
 		}
 	}
@@ -136,36 +136,36 @@ func (s *Server) convertStream(
 			break
 		}
 		if writeErr := s.writeEvents(ctx, client, model, converted, out); writeErr != nil {
-			s.logger.Warn("写出流式事件失败", "error", writeErr.Error())
+			s.logger.Warn("写出流式事件失败", "request_id", requestIDOf(ctx), "error", writeErr.Error())
 			return
 		}
 	}
 	if failure != "" {
-		s.logger.Warn("上游流中断", "model", model, "error", failure)
+		s.logger.Warn("上游流中断", "request_id", requestIDOf(ctx), "model", model, "error", failure)
 		if events, ok := stream.Fail("upstream_stream_error", failure, ""); ok {
 			if writeErr := s.writeEvents(ctx, client, model, events, out); writeErr != nil {
-				s.logger.Warn("写出错误事件失败", "error", writeErr.Error())
+				s.logger.Warn("写出错误事件失败", "request_id", requestIDOf(ctx), "error", writeErr.Error())
 			}
 		}
 		return
 	}
 	final, err := stream.Finalize(ctx)
 	if err != nil {
-		s.logger.Warn("流式收尾失败", "error", err.Error())
+		s.logger.Warn("流式收尾失败", "request_id", requestIDOf(ctx), "error", err.Error())
 	}
-	final = s.rewriteStreamEnd(ctx, client, model, stream.Usage(), final)
+	usage := stream.Usage()
+	final = s.rewriteStreamEnd(ctx, client, model, usage, final)
 	if err := s.writeEvents(ctx, client, model, final, out); err != nil {
-		s.logger.Warn("写出收尾事件失败", "error", err.Error())
+		s.logger.Warn("写出收尾事件失败", "request_id", requestIDOf(ctx), "error", err.Error())
 		return
 	}
 	if client == dialect.OpenAIChat {
 		if err := out.WriteRaw(dialect.DoneEvent()); err != nil {
-			s.logger.Warn("写出结束标记失败", "error", err.Error())
+			s.logger.Warn("写出结束标记失败", "request_id", requestIDOf(ctx), "error", err.Error())
 		}
 	}
-	if usage := stream.Usage(); usage != nil {
-		s.logger.Debug("流式请求完成", "model", model, "usage", usage)
-	}
+	// 用量交给访问日志那一行，这里不再单独记一条。
+	accessOf(ctx).recordUsage(usage)
 }
 
 // writeEvents 逐条写出事件，每条都过一遍 onEvent。
@@ -187,7 +187,7 @@ func (s *Server) emitEvent(ctx context.Context, client dialect.Name, model, even
 	if s.plugins.HasAny(plugin.HookEvent) {
 		rewritten, err := s.rewriteEvent(ctx, client, name, payload)
 		if err != nil {
-			s.logger.Warn("事件钩子执行失败", "error", err.Error())
+			s.logger.Warn("事件钩子执行失败", "request_id", requestIDOf(ctx), "error", err.Error())
 		} else {
 			name, payload = rewritten.Name, rewritten.Data
 		}
@@ -246,7 +246,7 @@ func (s *Server) rewriteStreamEnd(ctx context.Context, client dialect.Name, mode
 		Events:  items,
 	})
 	if err != nil {
-		s.logger.Warn("构造收尾钩子负载失败", "error", err.Error())
+		s.logger.Warn("构造收尾钩子负载失败", "request_id", requestIDOf(ctx), "error", err.Error())
 		return events
 	}
 	outcome := s.plugins.Apply(ctx, plugin.HookStreamEnd, payload, mergeStreamEnd, nil, s.session())
@@ -255,7 +255,7 @@ func (s *Server) rewriteStreamEnd(ctx context.Context, client dialect.Name, mode
 	}
 	var final streamEndPayload
 	if err := json.Unmarshal(outcome.Data, &final); err != nil {
-		s.logger.Warn("解析收尾钩子输出失败", "error", err.Error())
+		s.logger.Warn("解析收尾钩子输出失败", "request_id", requestIDOf(ctx), "error", err.Error())
 		return events
 	}
 	if final.Events == nil {

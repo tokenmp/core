@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,7 +21,7 @@ const (
 	geminiPrefix = "/v1beta/models/"
 )
 
-// routes 组装路由表。
+// routes 组装路由表，最外层包上访问日志。
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(healthPath, s.handleHealth)
@@ -29,7 +30,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc(dialect.OpenAIResponses.LocalPath(), s.exact(dialect.OpenAIResponses))
 	mux.HandleFunc(dialect.ClaudeMessages.LocalPath(), s.exact(dialect.ClaudeMessages))
 	mux.HandleFunc(geminiPrefix, s.handleGemini)
-	return mux
+	return s.withAccessLog(mux)
 }
 
 // exact 返回一个只接受 POST 的处理器。
@@ -50,7 +51,7 @@ func (s *Server) handleGemini(writer http.ResponseWriter, request *http.Request)
 	rest := strings.TrimPrefix(request.URL.Path, geminiPrefix)
 	actionIndex := strings.LastIndex(rest, ":")
 	if actionIndex <= 0 || actionIndex == len(rest)-1 {
-		s.writeError(writer, http.StatusNotFound, "路由不存在",
+		s.writeError(request.Context(), writer, http.StatusNotFound, "路由不存在",
 			fmt.Sprintf("路径 %s 缺少模型名或动作", request.URL.Path))
 		return
 	}
@@ -63,7 +64,7 @@ func (s *Server) handleGemini(writer http.ResponseWriter, request *http.Request)
 	case "streamGenerateContent":
 		stream = true
 	default:
-		s.writeError(writer, http.StatusNotFound, "路由不存在",
+		s.writeError(request.Context(), writer, http.StatusNotFound, "路由不存在",
 			fmt.Sprintf("未知动作 %s，可用动作为 generateContent 与 streamGenerateContent", action))
 		return
 	}
@@ -74,7 +75,7 @@ func (s *Server) handleGemini(writer http.ResponseWriter, request *http.Request)
 func (s *Server) handleHealth(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet {
 		writer.Header().Set("Allow", http.MethodGet)
-		s.writeError(writer, http.StatusMethodNotAllowed, "方法不允许", "该端点只接受 GET")
+		s.writeError(request.Context(), writer, http.StatusMethodNotAllowed, "方法不允许", "该端点只接受 GET")
 		return
 	}
 	writer.Header().Set("Content-Type", "application/json")
@@ -86,7 +87,7 @@ func (s *Server) handleHealth(writer http.ResponseWriter, request *http.Request)
 func (s *Server) handleModels(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodGet {
 		writer.Header().Set("Allow", http.MethodGet)
-		s.writeError(writer, http.StatusMethodNotAllowed, "方法不允许", "该端点只接受 GET")
+		s.writeError(request.Context(), writer, http.StatusMethodNotAllowed, "方法不允许", "该端点只接受 GET")
 		return
 	}
 	type modelEntry struct {
@@ -104,7 +105,7 @@ func (s *Server) handleModels(writer http.ResponseWriter, request *http.Request)
 	writer.Header().Set("Content-Type", "application/json")
 	writer.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(writer).Encode(response); err != nil {
-		s.logger.Warn("写出模型列表失败", "error", err.Error())
+		s.logger.Warn("写出模型列表失败", "request_id", requestIDOf(request.Context()), "error", err.Error())
 	}
 }
 
@@ -114,7 +115,7 @@ func (s *Server) requirePost(writer http.ResponseWriter, request *http.Request) 
 		return true
 	}
 	writer.Header().Set("Allow", http.MethodPost)
-	s.writeError(writer, http.StatusMethodNotAllowed, "方法不允许", "该端点只接受 POST")
+	s.writeError(request.Context(), writer, http.StatusMethodNotAllowed, "方法不允许", "该端点只接受 POST")
 	return false
 }
 
@@ -124,11 +125,11 @@ func (s *Server) readBody(writer http.ResponseWriter, request *http.Request) ([]
 	if err != nil {
 		var maxBytes *http.MaxBytesError
 		if errors.As(err, &maxBytes) {
-			s.writeError(writer, http.StatusRequestEntityTooLarge, "请求体过大",
+			s.writeError(request.Context(), writer, http.StatusRequestEntityTooLarge, "请求体过大",
 				fmt.Sprintf("请求体超过 %d 字节上限", s.maxBodyBytes))
 			return nil, false
 		}
-		s.writeError(writer, http.StatusBadRequest, "请求体不可读", err.Error())
+		s.writeError(request.Context(), writer, http.StatusBadRequest, "请求体不可读", err.Error())
 		return nil, false
 	}
 	return body, true
@@ -137,7 +138,8 @@ func (s *Server) readBody(writer http.ResponseWriter, request *http.Request) ([]
 // writeError 按 OpenAI 的错误形状写出错误响应。
 //
 // 错误形状只统一本地产生的这一种；上游返回的错误按原样透传，不做跨方言翻译。
-func (s *Server) writeError(writer http.ResponseWriter, status int, code, message string) {
+// 带 ctx 是为了让「写出错误响应失败」这条日志也能带上 request_id。
+func (s *Server) writeError(ctx context.Context, writer http.ResponseWriter, status int, code, message string) {
 	writer.Header().Set("Content-Type", "application/json")
 	writer.WriteHeader(status)
 	payload := map[string]any{
@@ -148,7 +150,7 @@ func (s *Server) writeError(writer http.ResponseWriter, status int, code, messag
 		},
 	}
 	if err := json.NewEncoder(writer).Encode(payload); err != nil {
-		s.logger.Warn("写出错误响应失败", "error", err.Error())
+		s.logger.Warn("写出错误响应失败", "request_id", requestIDOf(ctx), "error", err.Error())
 	}
 }
 
