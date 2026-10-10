@@ -26,11 +26,12 @@ type Outcome struct {
 	Status int
 	// Duration 是从请求进入中间件到处理器返回的时长，含重试与等待上游的全部时间。
 	Duration time.Duration
-	// FirstByte 是从请求进入中间件到首次写出响应头或响应体的时长。整个请求没有写出过
-	// 任何东西时为 0，宿主可以据此判断 TTFT 无从计算。
+	// FirstByte 是从请求进入中间件到首次写出响应体的时长，也就是 core 能测到的 TTFT。
+	// 整个请求没有写出过响应体时为 0。
 	//
-	// 取「首次写出」而不是「首次写出响应体」：流式响应里处理器先写响应头再写第一个
-	// 分片，两者之间通常没有别的工作，而 net/http 不暴露分片何时真的离开缓冲区。
+	// 只算响应体，不算响应头：流式路径拿到上游响应头就写响应头，而第一个分片可能过很久
+	// 才到，按响应头记会让 TTFT 系统性偏小。非流式响应是一次写完的，这个值因此约等于
+	// Duration，看不出 TTFT——该不该算由宿主按 Streaming 自己判断。
 	FirstByte time.Duration
 	// BytesWritten 是写回客户端的响应体字节数，不含响应头。
 	BytesWritten int64
@@ -54,12 +55,30 @@ type Attempt struct {
 	Channel  string
 	Dialect  dialect.Name
 	Upstream string
-	// Status 是上游返回的状态码。0 表示没拿到上游响应：转换失败、连接失败，
-	// 或渠道在装配里不存在。
+	// Status 是上游返回的状态码。0 表示没拿到上游响应，原因看 Failure。
 	Status int
+	// Failure 是没拿到上游响应的原因，Status 非 0 时恒为 FailureNone。
+	Failure Failure
 	// Duration 是这次尝试的耗时，从选定候选算到拿到响应头或失败。
 	Duration time.Duration
 }
+
+// Failure 是一次尝试没拿到上游响应的原因。
+//
+// 取值封闭：不把上游的错误文字带进来。那是客户端与上游可控的字符串，长度没有上限，
+// 放进公开面就得跟着定一套截断口径。原因文字在 WARN 日志里。
+type Failure string
+
+const (
+	// FailureNone 表示没有失败，看 Status。
+	FailureNone Failure = ""
+	// FailureChannel 表示渠道在装配里不存在。
+	FailureChannel Failure = "channel"
+	// FailureConvert 表示请求转换失败，没发出请求。
+	FailureConvert Failure = "convert"
+	// FailureConnect 表示连接上游失败，或读上游响应失败。
+	FailureConnect Failure = "connect"
+)
 
 // Usage 是上游给出的用量。字段与访问日志一致，够算 TPS 与账目。
 type Usage struct {

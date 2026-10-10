@@ -57,7 +57,7 @@ func newOutcomeServer(t *testing.T, yaml string) (*httptest.Server, *outcomeColl
 	}
 	logger := slog.New(slog.NewJSONHandler(&logBuffer{}, nil))
 	collector := &outcomeCollector{}
-	handler, err := server.FromConfig(cfg, logger, server.WithRequestDone(collector.add))
+	handler, err := server.FromConfigWith(cfg, logger, server.WithRequestDone(collector.add))
 	if err != nil {
 		t.Fatalf("装配服务失败: %v", err)
 	}
@@ -218,6 +218,45 @@ models:
 	}
 }
 
+// TestOutcomeFirstByteIsBodyNotHeader 覆盖首字节时间的测量点：上游先刷出响应头、过一会
+// 儿才发第一个分片时，FirstByte 必须反映分片到达，而不是响应头写出。
+//
+// 记成响应头的话，这个值当 TTFT 交给宿主会系统性偏小。
+func TestOutcomeFirstByteIsBodyNotHeader(t *testing.T) {
+	const gap = 200 * time.Millisecond
+	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		writer.(http.Flusher).Flush()
+		// 响应头已经出去了，第一个分片要等一会儿才写。
+		time.Sleep(gap)
+		_, _ = writer.Write([]byte("data: first\n\n"))
+		_, _ = writer.Write([]byte("data: [DONE]\n\n"))
+		writer.(http.Flusher).Flush()
+	})
+	front, outcomes := newOutcomeServer(t, `
+channels:
+  - {name: upstream, dialect: openai, base_url: "`+upstreamServer.URL+`"}
+models:
+  - {match: "client-model", channel: upstream}
+`)
+
+	status, _, _ := post(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","stream":true,"messages":[{"role":"user","content":"你好"}]}`)
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d", status)
+	}
+
+	outcome := outcomes.wait(t, 1)[0]
+	if outcome.FirstByte < gap/2 {
+		t.Fatalf("FirstByte 记成了响应头写出的时刻：%v，而响应头与第一个分片之间隔了 %v",
+			outcome.FirstByte, gap)
+	}
+	if outcome.FirstByte > outcome.Duration {
+		t.Fatalf("FirstByte 不该超过 Duration: first=%v duration=%v", outcome.FirstByte, outcome.Duration)
+	}
+}
+
 // TestOutcomeCountsEveryAttempt 覆盖重试：降级换过渠道之后，每次尝试的耗时与状态
 // 都在 Outcome 里，不只一个条数。
 func TestOutcomeCountsEveryAttempt(t *testing.T) {
@@ -286,6 +325,10 @@ models:
 	if len(outcome.Attempts) != 1 || outcome.Attempts[0].Status != 0 {
 		t.Fatalf("连接失败时状态应当记 0: %+v", outcome.Attempts)
 	}
+	// 状态 0 分得出原因：连不上、转换失败与渠道不存在是三件事。
+	if outcome.Attempts[0].Failure != server.FailureConnect {
+		t.Fatalf("连接失败应当标成 %q，实际 %q", server.FailureConnect, outcome.Attempts[0].Failure)
+	}
 }
 
 // TestOutcomeForLocalEndpoint 覆盖不经过转发路径的请求：仍然是每条请求一次回调。
@@ -311,6 +354,23 @@ models:
 	}
 	if outcome.Usage != nil {
 		t.Fatalf("本地端点没有用量: %+v", outcome.Usage)
+	}
+}
+
+// TestFromConfigWithSkipsNilOption 覆盖 nil 选项：宿主用变量拼选项时递进来 nil，
+// 不该让装配炸掉。
+func TestFromConfigWithSkipsNilOption(t *testing.T) {
+	cfg, err := config.Parse(strings.NewReader(`
+channels:
+  - {name: upstream, dialect: openai, base_url: "https://example.com"}
+models:
+  - {match: "client-model", channel: upstream}
+`))
+	if err != nil {
+		t.Fatalf("解析配置失败: %v", err)
+	}
+	if _, err := server.FromConfigWith(cfg, slog.New(slog.DiscardHandler), nil); err != nil {
+		t.Fatalf("nil 选项应当被跳过: %v", err)
 	}
 }
 

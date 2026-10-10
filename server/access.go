@@ -96,8 +96,8 @@ func (r *accessRecord) served(channel string) {
 	r.attempts = len(r.tries)
 }
 
-// recordAttempt 记下一次候选尝试。status 为 0 表示没拿到上游响应。
-func (r *accessRecord) recordAttempt(route config.Route, status int, duration time.Duration) {
+// recordAttempt 记下一次候选尝试。没拿到上游响应时 status 为 0，原因看 failure。
+func (r *accessRecord) recordAttempt(route config.Route, status int, failure Failure, duration time.Duration) {
 	if r == nil {
 		return
 	}
@@ -106,6 +106,7 @@ func (r *accessRecord) recordAttempt(route config.Route, status int, duration ti
 		Dialect:  route.Dialect,
 		Upstream: route.Upstream,
 		Status:   status,
+		Failure:  failure,
 		Duration: duration,
 	})
 }
@@ -192,14 +193,14 @@ func (s *Server) logArrival(record *accessRecord) {
 // 级别口径：状态码小于 400 记 INFO，其余记 WARN。默认的 log.level 是 info，
 // 因此服务只要在跑就能看见每个请求，包括同方言透传这条最常见的路径；失败请求
 // 与既有的 WARN 行同级，一起由 log.level 控制。
-func (s *Server) logAccess(record *accessRecord) {
+func (s *Server) logAccess(record *accessRecord, finished time.Time) {
 	status := effectiveStatus(record)
 	attrs := []any{
 		"request_id", record.requestID,
 		"method", record.method,
 		"path", record.path,
 		"status", status,
-		"duration", s.now().Sub(record.started),
+		"duration", finished.Sub(record.started),
 		"model", record.model,
 		"channel", record.channel,
 		"attempts", record.attempts,
@@ -230,9 +231,13 @@ func effectiveStatus(record *accessRecord) int {
 }
 
 // finish 收尾一次请求：写出完成行，并在宿主设了回调时把原始量交出去。
+//
+// 结束时刻在这里采一次，日志与 Outcome 用同一个值。采在 logAccess 之前：日志 sink 慢的
+// 时候，写完成行的耗时不应当算进这次请求的服务时长。
 func (s *Server) finish(record *accessRecord) {
-	s.logAccess(record)
-	s.notify(record)
+	finished := s.now()
+	s.logAccess(record, finished)
+	s.notify(record, finished)
 }
 
 // notify 把这次请求的原始量交给宿主。
@@ -242,7 +247,7 @@ func (s *Server) finish(record *accessRecord) {
 //
 // 没设回调时不构造 Outcome。尝试列表不在此列：访问日志的 attempts 就是它算出来的，
 // 不设回调也照记。
-func (s *Server) notify(record *accessRecord) {
+func (s *Server) notify(record *accessRecord, finished time.Time) {
 	if s.onRequestDone == nil {
 		return
 	}
@@ -253,11 +258,11 @@ func (s *Server) notify(record *accessRecord) {
 				"error", fmt.Sprint(recovered))
 		}
 	}()
-	s.onRequestDone(s.outcomeOf(record))
+	s.onRequestDone(s.outcomeOf(record, finished))
 }
 
 // outcomeOf 把访问记录整理成交给宿主的原始量。
-func (s *Server) outcomeOf(record *accessRecord) Outcome {
+func (s *Server) outcomeOf(record *accessRecord, finished time.Time) Outcome {
 	outcome := Outcome{
 		RequestID:    record.requestID,
 		Method:       record.method,
@@ -265,7 +270,7 @@ func (s *Server) outcomeOf(record *accessRecord) Outcome {
 		Client:       record.client,
 		UserAgent:    record.userAgent,
 		Status:       effectiveStatus(record),
-		Duration:     s.now().Sub(record.started),
+		Duration:     finished.Sub(record.started),
 		BytesWritten: record.bytesWritten,
 		Model:        record.model,
 		Channel:      record.channel,
@@ -343,11 +348,12 @@ type accessWriter struct {
 }
 
 // WriteHeader 只记第一个状态码，与 net/http 的行为一致。
+//
+// 不在这里标首字节：流式路径拿到上游响应头就写响应头，而第一个分片可能过很久才到。
 func (w *accessWriter) WriteHeader(status int) {
 	if w.record.status == 0 {
 		w.record.status = status
 	}
-	w.markFirstByte()
 	w.ResponseWriter.WriteHeader(status)
 }
 
@@ -363,7 +369,11 @@ func (w *accessWriter) Write(body []byte) (int, error) {
 	return written, err
 }
 
-// markFirstByte 记下首次写出的时刻。写响应头或写响应体，先到的那个算。
+// markFirstByte 记下首次写出响应体的时刻，这就是能测到的 TTFT。
+//
+// 不把写响应头也算进来：流式路径拿到上游响应头就写响应头，第一个分片可能过很久才到。
+// 实测过上游刷头后 500ms 才发首片的情形：按响应头记得到 2ms，按响应体记才是 505ms，
+// 前者当 TTFT 交给宿主会系统性偏小。
 func (w *accessWriter) markFirstByte() {
 	if w.record.firstByteAt.IsZero() {
 		w.record.firstByteAt = w.now()

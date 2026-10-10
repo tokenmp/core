@@ -132,12 +132,18 @@ func New(opts Options) (*Server, error) {
 
 // FromConfig 按配置装配渠道与插件，再创建服务。
 //
-// opts 用来覆盖装配参数，不传时与只传 cfg 和 logger 的行为相同；要完全掌控装配
-// 就直接用 New。
-//
 // 配置里启用但目录里不存在的插件会直接报错：静默降级会让「插件没生效」变成
 // 一个只能靠读日志发现的问题。
-func FromConfig(cfg *config.Config, logger *slog.Logger, opts ...Option) (*Server, error) {
+func FromConfig(cfg *config.Config, logger *slog.Logger) (*Server, error) {
+	return FromConfigWith(cfg, logger)
+}
+
+// FromConfigWith 与 FromConfig 相同，另外可以用 opts 覆盖装配参数。
+//
+// 做成单独一个函数而不是给 FromConfig 加可变参数：可变参数会让它不再能赋给
+// func(*config.Config, *slog.Logger) (*Server, error) 类型的变量，按仓库的兼容
+// 承诺算破坏性变更。要完全掌控装配就直接用 New。
+func FromConfigWith(cfg *config.Config, logger *slog.Logger, opts ...Option) (*Server, error) {
 	specs := make([]channel.Spec, 0, len(cfg.Channels))
 	for _, item := range cfg.Channels {
 		itemDialect, _ := dialect.Parse(item.Dialect)
@@ -167,6 +173,10 @@ func FromConfig(cfg *config.Config, logger *slog.Logger, opts ...Option) (*Serve
 		Logger:   logger,
 	}
 	for _, apply := range opts {
+		// nil 当空操作：宿主用变量拼选项时递进来 nil 不该让装配炸掉。
+		if apply == nil {
+			continue
+		}
 		apply(&options)
 	}
 	return New(options)

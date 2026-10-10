@@ -120,7 +120,7 @@ func (s *Server) callUpstream(
 		upstream, ok := s.channels.Get(route.Channel)
 		if !ok {
 			lastMessage = fmt.Sprintf("渠道 %s 不存在", route.Channel)
-			accessOf(ctx).recordAttempt(route, 0, s.now().Sub(started))
+			accessOf(ctx).recordAttempt(route, 0, FailureChannel, s.now().Sub(started))
 			continue
 		}
 		prepared, err := s.engine.PrepareRequest(ctx, relay.Request{
@@ -134,7 +134,7 @@ func (s *Server) callUpstream(
 		if err != nil {
 			lastMessage = err.Error()
 			s.logger.Warn("请求转换失败", "request_id", requestIDOf(ctx), "route", routeOf(route), "error", err.Error())
-			accessOf(ctx).recordAttempt(route, 0, s.now().Sub(started))
+			accessOf(ctx).recordAttempt(route, 0, FailureConvert, s.now().Sub(started))
 			continue
 		}
 		response, err := upstream.Send(ctx, channel.Request{
@@ -146,18 +146,18 @@ func (s *Server) callUpstream(
 		if err != nil {
 			lastMessage = err.Error()
 			s.logger.Warn("上游请求失败", "request_id", requestIDOf(ctx), "route", routeOf(route), "error", err.Error())
-			accessOf(ctx).recordAttempt(route, 0, s.now().Sub(started))
+			accessOf(ctx).recordAttempt(route, 0, FailureConnect, s.now().Sub(started))
 			continue
 		}
 		if response.StatusCode >= http.StatusBadRequest {
 			if shouldTryNext(response.StatusCode, index, len(routes)) {
 				lastMessage = readErrorBody(response)
 				s.logger.Warn("上游拒绝请求，改试下一条路由", "request_id", requestIDOf(ctx), "route", routeOf(route), "status", response.StatusCode)
-				accessOf(ctx).recordAttempt(route, response.StatusCode, s.now().Sub(started))
+				accessOf(ctx).recordAttempt(route, response.StatusCode, FailureNone, s.now().Sub(started))
 				continue
 			}
 			// 不可重试的状态，或已经是最后一条候选：原样交给调用方。
-			accessOf(ctx).recordAttempt(route, response.StatusCode, s.now().Sub(started))
+			accessOf(ctx).recordAttempt(route, response.StatusCode, FailureNone, s.now().Sub(started))
 			accessOf(ctx).served(route.Channel)
 			return response, prepared, route
 		}
@@ -168,7 +168,7 @@ func (s *Server) callUpstream(
 				"count", len(prepared.Diagnostics()),
 				"diagnostics", prepared.Diagnostics())
 		}
-		accessOf(ctx).recordAttempt(route, response.StatusCode, s.now().Sub(started))
+		accessOf(ctx).recordAttempt(route, response.StatusCode, FailureNone, s.now().Sub(started))
 		accessOf(ctx).served(route.Channel)
 		return response, prepared, route
 	}
