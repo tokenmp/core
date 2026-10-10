@@ -65,6 +65,30 @@ func main() {
 服务给每个进入的请求记两行访问日志（进入与完成），用传进来的 logger 写出，
 级别按配置的 `log.level` 定。字段与级别口径见[配置规范](docs/config.md)的「访问日志」一节。
 
+宿主想在每次请求结束时记自己的指标，用 `WithRequestDone` 拿原始量：
+
+```go
+service, err := server.FromConfigWith(cfg, logger, server.WithRequestDone(func(outcome server.Outcome) {
+    // 口径由宿主定，core 只交原始量。
+    logger.Info("请求结束",
+        "ttft", outcome.FirstByte,
+        "duration", outcome.Duration,
+        "bytes", outcome.BytesWritten,
+        "streaming", outcome.Streaming,
+        "attempts", len(outcome.Attempts))
+}))
+```
+
+`Outcome` 带首字节时间、写出字节数、每次候选尝试的耗时与状态、用量、模型与渠道。
+三件事要留意：
+
+- `FirstByte` 是首次写出**响应体**的时长。流式请求里它就是要算的 TTFT；
+  非流式响应是一次写完的，这个值约等于 `Duration`，看不出 TTFT。
+- `Usage` 只在跨方言转发且上游给出用量时非空。同方言透传按字节转发、不解析，
+  流式响应的 TPS 因此算不出来。
+- 回调同步跑在请求的 goroutine 上，宿主在里面做的耗时工作会算进客户端等待时间里。
+  它 panic 会被吞掉并记一行 ERROR，不连累别的请求。
+
 只用转换内核、不起服务也是支持的：
 
 ```go

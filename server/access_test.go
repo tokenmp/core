@@ -127,8 +127,8 @@ func onlyLine(t *testing.T, lines []map[string]any, msg string) map[string]any {
 
 // completedLines 只留完成行。
 //
-// 进入行与完成行的 path、method、client 完全相同，按这些字段取行之前必须先滤掉
-// 进入行，否则会取到没有 status 的进入行。
+// 进入行与完成行的 method、path 相同，按这些字段取行之前必须先滤掉进入行，
+// 否则会取到没有 status 的进入行。
 func completedLines(t *testing.T, lines []map[string]any) []map[string]any {
 	t.Helper()
 	var found []map[string]any
@@ -183,13 +183,20 @@ models:
 	if status != http.StatusOK {
 		t.Fatalf("状态码不符: %d %s", status, body)
 	}
-	line := onlyLine(t, waitForLog(t, logs, "请求完成", 1), "请求完成")
+	lines := waitForLog(t, logs, "请求完成", 1)
+	line := onlyLine(t, lines, "请求完成")
 	assertField(t, line, "level", "INFO")
 	assertField(t, line, "method", "POST")
 	assertField(t, line, "path", "/v1/chat/completions")
 	assertField(t, line, "model", "client-model")
 	assertField(t, line, "channel", "upstream")
-	assertField(t, line, "client", "127.0.0.1")
+	// 客户端标识只在进入行里，完成行不再重复。
+	assertField(t, onlyLine(t, lines, "请求进入"), "client", "127.0.0.1")
+	for _, absent := range []string{"client", "user_agent"} {
+		if _, ok := line[absent]; ok {
+			t.Fatalf("完成行不该再写 %s，进入行里已经有了: %v", absent, line)
+		}
+	}
 	if got := numberField(t, line, "status"); got != http.StatusOK {
 		t.Fatalf("状态码字段不符: %v", got)
 	}
@@ -281,9 +288,10 @@ models:
 	}
 }
 
-// TestAccessLogReportsUserAgent 覆盖客户端标识：两行都带 user_agent。
+// TestAccessLogReportsUserAgent 覆盖客户端标识：user_agent 只在进入行里。
 //
 // 默认只听 127.0.0.1 时 client 恒为 127.0.0.1，认不出是谁在调用，user_agent 补上这一点。
+// 进入行必定写出（在处理器之前，panic 路径也写出），完成行不必再重复一遍。
 func TestAccessLogReportsUserAgent(t *testing.T) {
 	front, logs := newLoggingServer(t, `
 channels:
@@ -303,9 +311,7 @@ models:
 	_ = response.Body.Close()
 
 	lines := waitForLog(t, logs, "请求完成", 1)
-	for _, msg := range []string{"请求进入", "请求完成"} {
-		assertField(t, onlyLine(t, lines, msg), "user_agent", "claude-cli/2.1.287 (external, cli)")
-	}
+	assertField(t, onlyLine(t, lines, "请求进入"), "user_agent", "claude-cli/2.1.287 (external, cli)")
 }
 
 // TestAccessLogReportsEmptyUserAgent 覆盖客户端不发这个请求头：字段留空串，
@@ -330,9 +336,7 @@ models:
 	_ = response.Body.Close()
 
 	lines := waitForLog(t, logs, "请求完成", 1)
-	for _, msg := range []string{"请求进入", "请求完成"} {
-		assertField(t, onlyLine(t, lines, msg), "user_agent", "")
-	}
+	assertField(t, onlyLine(t, lines, "请求进入"), "user_agent", "")
 }
 
 // assertClipped 断言一个字段被截到文档写明的 256 字节之内，并以省略号结尾。
@@ -378,10 +382,16 @@ models:
 	_ = response.Body.Close()
 
 	lines := waitForLog(t, logs, "请求完成", 2)
+	// method 与 path 两行都有，user_agent 只有进入行有。
 	for _, line := range lines {
-		for _, field := range []string{"method", "path", "user_agent"} {
+		for _, field := range []string{"method", "path"} {
 			if got := len(stringField(t, line, field)); got > 256 {
 				t.Fatalf("%s 没有被截断：%d 字节", field, got)
+			}
+		}
+		if line["msg"] == "请求进入" {
+			if got := len(stringField(t, line, "user_agent")); got > 256 {
+				t.Fatalf("user_agent 没有被截断：%d 字节", got)
 			}
 		}
 	}
