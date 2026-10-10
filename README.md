@@ -116,6 +116,7 @@ service, err := server.FromConfigWith(cfg, logger, server.WithoutAccessLog(),
 
 - 包装 `http.ResponseWriter` 时必须把 `Flush` 转发下去，
   否则流式响应会静默退化成不刷新。
+- `OutcomeFromContext` 只能在本次请求的 goroutine 上调用：它读的那条记录不加锁。
 - 改请求头不会传到上游 —— 上游请求头来自渠道配置，内核不从进来的请求里抄。
   请求体可以换：内核从 `request.Body` 读，换过之后参与路由的就是新内容。
 

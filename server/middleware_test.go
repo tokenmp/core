@@ -233,6 +233,48 @@ models:
 	}
 }
 
+// TestOutcomeFromContextBeforeNextIsPartial 覆盖文档写明的边界：在 next 返回之前调用只会
+// 拿到一份残缺的快照。状态码按「没写出响应头就是 200」记，不是这一时刻真的写了什么。
+func TestOutcomeFromContextBeforeNextIsPartial(t *testing.T) {
+	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, openAIChatResponse)
+	})
+	var (
+		early  server.Outcome
+		usable bool
+	)
+	front, _, _ := newSeamServer(t, seamYAML(upstreamServer.URL), server.WithMiddleware(
+		func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				early, usable = server.OutcomeFromContext(request.Context())
+				next.ServeHTTP(writer, request)
+			})
+		}))
+
+	status, _, body := post(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`)
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d %s", status, body)
+	}
+	if !usable {
+		t.Fatal("请求范围内应当取得到")
+	}
+	if early.RequestID == "" {
+		t.Fatalf("记录在进入时就建好了，request_id 不该是空的: %+v", early)
+	}
+	// 转发还没发生，内部数据都还是零值。
+	if early.Model != "" || early.Channel != "" || len(early.Attempts) != 0 || early.Usage != nil {
+		t.Fatalf("next 之前不该有内部数据: %+v", early)
+	}
+	if early.BytesWritten != 0 || early.FirstByte != 0 {
+		t.Fatalf("还没写响应，首字节与字节数都应当是 0: %+v", early)
+	}
+	// 状态码按约定记 200，不是这一时刻写了什么——文档因此要求在 next 之后读。
+	if early.Status != http.StatusOK {
+		t.Fatalf("快照里的状态码按「没写出响应头就是 200」记: %d", early.Status)
+	}
+}
+
 // TestOutcomeFromContextOutsideRequest 覆盖不在请求范围内时取不到数据。
 func TestOutcomeFromContextOutsideRequest(t *testing.T) {
 	if got, ok := server.OutcomeFromContext(context.Background()); ok {
