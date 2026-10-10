@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"time"
 
 	"github.com/tokenmp/core/dialect"
@@ -48,6 +49,23 @@ type Outcome struct {
 
 	// Usage 是上游给出的用量，上游没给时为 nil。
 	Usage *Usage
+}
+
+// OutcomeFromContext 返回本次请求到目前为止的原始量。
+//
+// 供装在 Options.Middleware 里的宿主中间件在 next 返回之后读取：那时内核已经填完渠道、
+// 每次候选尝试、用量、状态码、首字节时间与写出字节数。
+//
+// Duration 按调用时刻算，量的是「到现在为止」；Options.OnRequestDone 收到的那个以处理器
+// 返回为准，两者可能差一点宿主中间件自己的收尾工作。
+//
+// 不在内核的请求范围内（例如在 Handler() 之外调用）时返回零值与 false。
+func OutcomeFromContext(ctx context.Context) (Outcome, bool) {
+	record := accessOf(ctx)
+	if record == nil {
+		return Outcome{}, false
+	}
+	return record.outcome(record.now().Sub(record.started)), true
 }
 
 // Attempt 是一次候选尝试。

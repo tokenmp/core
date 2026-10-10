@@ -52,6 +52,24 @@ type Options struct {
 	// OnRequestDone 在每次请求结束时同步调用，交出这次请求的原始量。
 	// 为 nil 时什么也不做，也不构造 Outcome。
 	OnRequestDone func(Outcome)
+	// Middleware 包住内核的处理器，装在访问日志的内侧。宿主在这里记自己的日志、
+	// 测首字节、加响应头、接 tracing，也可以换掉请求体（内核从 request.Body 读，
+	// 换过之后参与路由的就是新内容）。
+	//
+	// 改请求头不会传到上游：上游请求头来自渠道配置与 `Auth`，内核不从进来的请求里抄。
+	//
+	// 它拿到的 context 里已经有本次请求的访问记录，因此在 next 返回之后可以用
+	// OutcomeFromContext 读到内核的内部数据（渠道、每次尝试、用量、首字节时间等）。
+	// 包装 http.ResponseWriter 时必须把 Flush 转发下去，否则流式响应会静默退化成
+	// 不刷新。
+	//
+	// 为 nil 时什么都不装。
+	Middleware func(http.Handler) http.Handler
+	// DisableAccessLog 关掉内核自己那两行访问日志。
+	//
+	// 关掉的是「请求进入」与「请求完成」，request_id 仍然生成、其余 WARN 行照旧带着它，
+	// OutcomeFromContext 与 OnRequestDone 也不受影响。默认为 false，即照常记录。
+	DisableAccessLog bool
 }
 
 // Option 覆盖 FromConfig 的装配参数。
@@ -60,6 +78,16 @@ type Option func(*Options)
 // WithRequestDone 设置每次请求结束时调用的回调，见 Options.OnRequestDone。
 func WithRequestDone(onDone func(Outcome)) Option {
 	return func(options *Options) { options.OnRequestDone = onDone }
+}
+
+// WithMiddleware 设置包住内核处理器的宿主中间件，见 Options.Middleware。
+func WithMiddleware(middleware func(http.Handler) http.Handler) Option {
+	return func(options *Options) { options.Middleware = middleware }
+}
+
+// WithoutAccessLog 关掉内核自己那两行访问日志，见 Options.DisableAccessLog。
+func WithoutAccessLog() Option {
+	return func(options *Options) { options.DisableAccessLog = true }
 }
 
 // Server 是一个转发服务。
@@ -80,6 +108,10 @@ type Server struct {
 	minPrefixBytes int
 	// onRequestDone 是宿主的请求结束回调，为 nil 表示不回调。
 	onRequestDone func(Outcome)
+	// middleware 是宿主包在内核处理器外面的中间件，为 nil 表示不装。
+	middleware func(http.Handler) http.Handler
+	// disableAccessLog 为真时不写内核自己那两行访问日志。
+	disableAccessLog bool
 }
 
 // New 创建服务。
@@ -123,8 +155,10 @@ func New(opts Options) (*Server, error) {
 			opts.Config.AffinityTTL(),
 			now,
 		),
-		minPrefixBytes: opts.Config.AffinityMinPrefixBytes(),
-		onRequestDone:  opts.OnRequestDone,
+		minPrefixBytes:   opts.Config.AffinityMinPrefixBytes(),
+		onRequestDone:    opts.OnRequestDone,
+		middleware:       opts.Middleware,
+		disableAccessLog: opts.DisableAccessLog,
 	}
 	server.handler = server.routes()
 	return server, nil

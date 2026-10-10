@@ -21,7 +21,10 @@ const (
 	geminiPrefix = "/v1beta/models/"
 )
 
-// routes 组装路由表，最外层包上访问日志。
+// routes 组装路由表：宿主中间件在内侧，访问日志包在最外层。
+//
+// 宿主中间件装在内侧而不是外侧，是为了让它拿到的 context 里已经有本次请求的访问记录，
+// 于是 next 返回之后能用 OutcomeFromContext 读到内核的内部数据。
 func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(healthPath, s.handleHealth)
@@ -30,7 +33,11 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc(dialect.OpenAIResponses.LocalPath(), s.exact(dialect.OpenAIResponses))
 	mux.HandleFunc(dialect.ClaudeMessages.LocalPath(), s.exact(dialect.ClaudeMessages))
 	mux.HandleFunc(geminiPrefix, s.handleGemini)
-	return s.withAccessLog(mux)
+	var handler http.Handler = mux
+	if s.middleware != nil {
+		handler = s.middleware(handler)
+	}
+	return s.withAccessLog(handler)
 }
 
 // exact 返回一个只接受 POST 的处理器。
