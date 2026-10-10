@@ -135,8 +135,10 @@ Gemini 的路径含模型名，不支持覆盖。
 给出用量时另有 `prompt_tokens`、`completion_tokens`、`total_tokens`，
 有缓存命中时加 `cached_tokens`；同方言透传不解析用量，这一行也就没有 token 字段。
 
-`client` 是去掉端口之后的客户端地址，`user_agent` 是请求头里的 `User-Agent`，
-超过 256 字节时截断并在末尾加省略号。`attempts` 是这条请求试过的候选条数，
+`client` 是去掉端口之后的客户端地址，`user_agent` 是请求头里的 `User-Agent`。
+
+`method`、`path`、`user_agent` 与 `model` 的值来自请求，超过 256 字节时截断，
+末尾的省略号算在这 256 字节之内。`attempts` 是这条请求试过的候选条数，
 转换失败与连接失败都算一次，`model` 是插件改写之后的模型名。
 
 `duration` 是 slog 的时长属性：`text` 格式下形如 `12.3ms`，`json` 下是纳秒整数。
