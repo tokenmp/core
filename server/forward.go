@@ -102,8 +102,9 @@ func usableRoutes(routes []config.Route) ([]config.Route, string) {
 
 // callUpstream 按候选路由依次尝试，返回第一个可用的上游响应。
 //
-// 有剩余候选且失败属于「渠道问题」时继续试下一条：连接错误、408、429、401、
-// 403 与 5xx。400、404、422 这类说明请求本身有问题，换渠道不会变好，直接返回。
+// 有剩余候选且失败属于「渠道问题」时继续试下一条。判据读候选渠道的 spec：
+// 默认是 408、429、401、403 与 5xx，配置可以按渠道覆盖。400、404、422 这类
+// 说明请求本身有问题，换渠道不会变好，默认直接返回。
 // 所有候选都在建立连接阶段失败时写出 502 与最后一条失败原因。
 func (s *Server) callUpstream(
 	ctx context.Context,
@@ -169,7 +170,7 @@ func (s *Server) callUpstream(
 		// 「为什么只发了一次」。max_retries 为 0 时不记。
 		// retries 用尽时另记一行 DEBUG。
 		if maxRetries := upstream.Spec().MaxRetries; maxRetries > 0 &&
-			channel.RetryableStatus(response.StatusCode) {
+			upstream.ShouldRetry(response.StatusCode) {
 			switch {
 			case retries < maxRetries:
 				s.logger.Warn("Retry-After 超过上限，不再重试",
@@ -186,7 +187,7 @@ func (s *Server) callUpstream(
 			}
 		}
 		if response.StatusCode >= http.StatusBadRequest {
-			if shouldTryNext(response.StatusCode, index, len(routes)) {
+			if upstream.ShouldFailover(response.StatusCode) && index < len(routes)-1 {
 				lastMessage = readErrorBody(response)
 				s.logger.Warn("上游拒绝请求，改试下一条路由", "request_id", requestIDOf(ctx), "route", routeOf(route), "status", response.StatusCode)
 				accessOf(ctx).recordAttempt(route, response.StatusCode, FailureNone, retries, s.now().Sub(started))
@@ -351,23 +352,6 @@ func (s *Server) rewriteResponse(ctx context.Context, client dialect.Name, model
 // session 返回本次调用的宿主环境。
 func (s *Server) session() plugin.Session {
 	return plugin.Session{Now: s.now(), Logger: s.logger}
-}
-
-// shouldTryNext 报告是否值得换下一条候选路由。
-func shouldTryNext(status, index, total int) bool {
-	if index >= total-1 {
-		return false
-	}
-	switch {
-	case status == http.StatusRequestTimeout,
-		status == http.StatusUnauthorized,
-		status == http.StatusForbidden,
-		status == http.StatusTooManyRequests,
-		status >= http.StatusInternalServerError:
-		return true
-	default:
-		return false
-	}
 }
 
 // isEventStream 报告上游响应是否是 SSE。

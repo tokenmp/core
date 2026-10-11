@@ -56,6 +56,7 @@ var keyDefaults = map[string]string{
 	"channels[].backoff.base":            "250ms",
 	"channels[].backoff.max":             "2s",
 	"channels[].backoff.max_retry_after": "120s",
+	"channels[].failover_statuses":       "空（沿用 retry.failover）",
 
 	"models[].match":    "必填",
 	"models[].channel":  "必填",
@@ -72,6 +73,9 @@ var keyDefaults = map[string]string{
 	"affinity.table_size":       "8192",
 	"affinity.ttl":              "10m",
 	"affinity.min_prefix_bytes": "4096",
+
+	"retry.in_channel": DefaultInChannelStatuses,
+	"retry.failover":   DefaultFailoverStatuses,
 }
 
 // Keys 返回配置键表，按 Config 的字段声明顺序排列。

@@ -342,6 +342,149 @@ channels:
 	}
 }
 
+// TestValidateRetryStatuses 覆盖 issue #28 的两组状态码集合：默认值、渠道级覆盖、
+// 解析范围与包含关系。报错要指出是哪个键的哪一项。
+func TestValidateRetryStatuses(t *testing.T) {
+	valid := []struct {
+		name string
+		yaml string
+	}{
+		{
+			"不写两组键用默认值",
+			`channels:
+  - {name: a, dialect: openai, base_url: "https://x"}
+`,
+		},
+		{
+			"全局两组在范围内",
+			`retry: {in_channel: "408,429", failover: "408,429,500-599"}
+` +
+				`channels:
+  - {name: a, dialect: openai, base_url: "https://x"}
+`,
+		},
+		{
+			"渠道覆盖包含全局渠道内集合",
+			`retry: {in_channel: "408,418"}
+` +
+				`channels:
+  - {name: a, dialect: openai, base_url: "https://x", failover_statuses: "408,418,429,500-599"}
+`,
+		},
+	}
+	for _, item := range valid {
+		t.Run(item.name, func(t *testing.T) {
+			if _, err := config.Parse(strings.NewReader(item.yaml)); err != nil {
+				t.Fatalf("不应报错: %v", err)
+			}
+		})
+	}
+
+	invalid := []struct {
+		name     string
+		yaml     string
+		keywords []string
+	}{
+		{
+			"渠道内集合写了非数字",
+			`retry: {in_channel: "abc"}
+` +
+				`channels:
+  - {name: a, dialect: openai, base_url: "https://x"}
+`,
+			[]string{"retry.in_channel", "第 1 项"},
+		},
+		{
+			"状态码超出范围",
+			`retry: {failover: "600"}
+` +
+				`channels:
+  - {name: a, dialect: openai, base_url: "https://x"}
+`,
+			[]string{"retry.failover", "超出 100 到 599"},
+		},
+		{
+			"区间起点大于终点",
+			`retry: {failover: "500-400"}
+` +
+				`channels:
+  - {name: a, dialect: openai, base_url: "https://x"}
+`,
+			[]string{"retry.failover", "起点大于终点"},
+		},
+		{
+			"全局换候选不是渠道内重试的超集",
+			`retry: {in_channel: "418", failover: "500-599"}
+` +
+				`channels:
+  - {name: a, dialect: openai, base_url: "https://x"}
+`,
+			[]string{"retry.failover", "418"},
+		},
+		{
+			"渠道覆盖不是渠道内重试的超集",
+			`retry: {in_channel: "418"}
+` +
+				`channels:
+  - {name: a, dialect: openai, base_url: "https://x", failover_statuses: "408,429,500-599"}
+`,
+			[]string{"channels[0].failover_statuses", "418"},
+		},
+	}
+	for _, item := range invalid {
+		t.Run(item.name, func(t *testing.T) {
+			_, err := config.Parse(strings.NewReader(item.yaml))
+			if err == nil {
+				t.Fatal("应当报错")
+			}
+			for _, keyword := range item.keywords {
+				if !strings.Contains(err.Error(), keyword) {
+					t.Fatalf("错误信息应包含 %q，实际: %v", keyword, err)
+				}
+			}
+		})
+	}
+}
+
+// TestRetryStatusesDefaults 覆盖默认集合：不写两组键时读出来的是内置值，
+// 渠道没覆盖时沿用全局 failover。
+func TestRetryStatusesDefaults(t *testing.T) {
+	cfg, err := config.Parse(strings.NewReader(`
+channels:
+  - {name: a, dialect: openai, base_url: "https://x"}
+`))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	inChannel, err := cfg.RetryStatuses()
+	if err != nil {
+		t.Fatalf("读渠道内集合失败: %v", err)
+	}
+	if want := []int{408, 429, 500, 502, 503, 504}; !equalInts(inChannel, want) {
+		t.Fatalf("默认渠道内集合不符: %v，期望 %v", inChannel, want)
+	}
+	channel, _ := cfg.ChannelByName("a")
+	failover, err := cfg.FailoverStatusesFor(channel)
+	if err != nil {
+		t.Fatalf("读换候选集合失败: %v", err)
+	}
+	if failover[0] != 401 || failover[len(failover)-1] != 599 {
+		t.Fatalf("默认换候选集合不符: %v", failover)
+	}
+}
+
+func equalInts(got, want []int) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range got {
+		if got[index] != want[index] {
+			return false
+		}
+	}
+	return true
+}
+
 // pooled 是一条渠道引用两个账号的最小配置，展开与头合并的用例都用它。
 // team-a 不带头，team-b 带一个与渠道同名的头，用来断言账号覆盖渠道。
 const pooled = `

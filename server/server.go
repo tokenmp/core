@@ -201,9 +201,19 @@ func FromConfigWith(cfg *config.Config, logger *slog.Logger, opts ...Option) (*S
 	// 插件与 Options.Config 都基于展开后的这一份：宿主与 Resolve 看到的候选名
 	// 必须和 channel.Set 里的键是同一批，否则会报「渠道 X 不存在」。
 	flat := cfg.Expand()
+	// 重试判据的生效集合在这里解析一次：in_channel 对所有渠道相同，failover
+	// 按渠道解析，渠道级 failover_statuses 覆盖全局的 retry.failover。
+	retryStatuses, err := flat.RetryStatuses()
+	if err != nil {
+		return nil, err
+	}
 	specs := make([]channel.Spec, 0, len(flat.Channels))
 	for _, item := range flat.Channels {
 		itemDialect, _ := dialect.Parse(item.Dialect)
+		failoverStatuses, failoverErr := flat.FailoverStatusesFor(item)
+		if failoverErr != nil {
+			return nil, failoverErr
+		}
 		specs = append(specs, channel.Spec{
 			Name:    item.Name,
 			Dialect: itemDialect,
@@ -225,6 +235,8 @@ func FromConfigWith(cfg *config.Config, logger *slog.Logger, opts ...Option) (*S
 				Max:           item.Backoff.Max.Duration(),
 				MaxRetryAfter: item.Backoff.MaxRetryAfter.Duration(),
 			},
+			RetryStatuses:    retryStatuses,
+			FailoverStatuses: failoverStatuses,
 		})
 	}
 	channels, err := channel.NewSet(specs)

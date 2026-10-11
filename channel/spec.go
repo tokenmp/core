@@ -75,6 +75,12 @@ type Spec struct {
 	Headers map[string]string
 	// Backoff 是渠道内重试的退避参数，零值字段按内置常量处理。
 	Backoff Backoff
+	// RetryStatuses 是渠道内重试的状态码集合，由装配层从全局的重试配置填入。
+	// 为空时用包级 RetryableStatus 那个内置集合。
+	RetryStatuses []int
+	// FailoverStatuses 是换下一条候选的状态码集合，只有 server 读它。为空时用
+	// 包级 FailoverStatus 那个内置集合；渠道级配置可以覆盖它。
+	FailoverStatuses []int
 }
 
 // DefaultTimeout 是未指定超时时的取值。
@@ -122,6 +128,16 @@ func (s Spec) Validate() error {
 	}
 	if s.Backoff.Base < 0 || s.Backoff.Max < 0 || s.Backoff.MaxRetryAfter < 0 {
 		return fmt.Errorf("channel: %s 的退避时长不能为负", s.Name)
+	}
+	for _, status := range s.RetryStatuses {
+		if status < 100 || status > 599 {
+			return fmt.Errorf("channel: %s 的 retry_statuses 里 %d 不在 100 到 599 之间", s.Name, status)
+		}
+	}
+	for _, status := range s.FailoverStatuses {
+		if status < 100 || status > 599 {
+			return fmt.Errorf("channel: %s 的 failover_statuses 里 %d 不在 100 到 599 之间", s.Name, status)
+		}
 	}
 	for name, value := range s.Headers {
 		if strings.ContainsAny(name, "\r\n") || strings.ContainsAny(value, "\r\n") {

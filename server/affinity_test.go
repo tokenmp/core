@@ -472,3 +472,36 @@ func TestAffinityChainDoesNotRememberFailedChannel(t *testing.T) {
 			records["first"].count())
 	}
 }
+
+// TestAffinityFollowsActualChannelAfterStatusOverride 钤住 issue #28 与亲和的关系：
+// 把 400 纳入某条渠道的换候选集合之后，第一轮由第二条服务，前缀链记住的仍然是
+// 真正服务成功的那条，后续轮次不再撞回 400 的那条。
+func TestAffinityFollowsActualChannelAfterStatusOverride(t *testing.T) {
+	firstRecord, firstServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusBadRequest, `{"error":{"message":"不认这个模型"}}`)
+	})
+	_, secondServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, affinityResponse("second"))
+	})
+	front := newServer(t, fmt.Sprintf(`
+channels:
+  - {name: first, dialect: openai, base_url: %q, failover_statuses: "400,404,408,429,500-599"}
+  - {name: second, dialect: openai, base_url: %q}
+models:
+  - {match: "client-model", channel: first, affinity: pool}
+  - {match: "client-model", channel: second, affinity: pool}
+`, firstServer.URL, secondServer.URL), "")
+
+	if got := served(t, front, "", chainBody(1)); got != "second" {
+		t.Fatalf("first 回 400 且覆盖集合包含 400 时应当由 second 服务，实际 %s", got)
+	}
+	afterFirstTurn := firstRecord.count()
+	for turn := 2; turn <= 3; turn++ {
+		if got := served(t, front, "", chainBody(turn)); got != "second" {
+			t.Fatalf("第 %d 轮应当沿用实际服务的 second，实际 %s", turn, got)
+		}
+	}
+	if got := firstRecord.count(); got != afterFirstTurn {
+		t.Fatalf("记住实际渠道之后不应当再撞回 400 的那条，first 又被调用了 %d 次", got-afterFirstTurn)
+	}
+}
