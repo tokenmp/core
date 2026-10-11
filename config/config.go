@@ -380,7 +380,6 @@ func (c *Config) Validate() error {
 	}
 
 	accounts := make(map[string]bool, len(c.Accounts))
-	referenced := make(map[string]bool, len(c.Accounts))
 	for i, account := range c.Accounts {
 		where := fmt.Sprintf("accounts[%d]", i)
 		if account.Name == "" {
@@ -441,7 +440,6 @@ func (c *Config) Validate() error {
 			if !accounts[name] {
 				problems = append(problems, fmt.Sprintf("%s.auth.accounts: 引用了不存在的账号 %s", where, name))
 			}
-			referenced[name] = true
 		}
 		// 纯内容判断：展开后的渠道两样只剩 KeyEnv，因此平铺形态不会触发。
 		if len(channel.Auth.Accounts) > 0 && channel.Auth.KeyEnv != "" {
@@ -449,11 +447,10 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	for i, account := range c.Accounts {
-		if account.Name != "" && !referenced[account.Name] {
-			problems = append(problems, fmt.Sprintf("accounts[%d]: 账号 %s 没有被任何渠道引用", i, account.Name))
-		}
-	}
+	// 没人引用的账号不是错。账号与引用它的渠道写在同一份文件里，「先建账号、再
+	// 挂到渠道上」必然经过账号还没人引用的中间状态，拒绝它会让一次只改一处的
+	// 工具全部卡住。运行时它不影响任何东西：不参与展开，不产生候选。
+	// 名字写错由上面那条「引用了不存在的账号」拦下，这里不必再拦一次。
 
 	for i, rule := range c.Models {
 		where := fmt.Sprintf("models[%d]", i)

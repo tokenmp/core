@@ -721,15 +721,6 @@ func TestValidateAccountsProblems(t *testing.T) {
 `,
 			keywords: []string{"channels[1].auth.accounts", "互斥"},
 		},
-		{
-			name: "账号没有被引用",
-			yaml: `accounts:
-  - {name: team-a, key_env: KEY_A}
-  - {name: team-b, key_env: KEY_B}
-` + channel + `  - {name: c1, dialect: openai, base_url: "https://x", auth: {style: bearer, accounts: [team-a]}}
-`,
-			keywords: []string{"accounts[1]", "账号 team-b 没有被任何渠道引用"},
-		},
 	}
 	for _, item := range cases {
 		t.Run(item.name, func(t *testing.T) {
@@ -743,6 +734,37 @@ func TestValidateAccountsProblems(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestUnreferencedAccountIsAllowed 是 issue #38 的回归用例：账号与引用它的渠道写在
+// 同一份文件里，「先建账号、再挂到渠道上」必然经过账号还没人引用的中间状态，
+// 那个状态必须能通过校验，否则一次只改一处的工具全部卡住。
+func TestUnreferencedAccountIsAllowed(t *testing.T) {
+	const yaml = `
+accounts:
+  - {name: team-a, key_env: KEY_A}
+  - {name: team-b, key_env: KEY_B}
+channels:
+  - {name: c0, dialect: openai, base_url: "https://x"}
+  - {name: c1, dialect: openai, base_url: "https://x", auth: {style: bearer, accounts: [team-a]}}
+`
+	cfg, err := config.Parse(strings.NewReader(yaml))
+	if err != nil {
+		t.Fatalf("没人引用的账号不该让加载失败: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("展开之后再校验也不该失败: %v", err)
+	}
+	// 展开只产出被引用的那个账号，没被引用的不产生候选。
+	routes := cfg.Resolve("anything")
+	if len(routes) != 0 {
+		t.Fatalf("这条配置没有模型规则，不该有候选: %+v", routes)
+	}
+	for _, channel := range cfg.Channels {
+		if channel.Name == "c1/team-b" {
+			t.Fatalf("没被引用的账号不该展开成渠道: %+v", cfg.Channels)
+		}
 	}
 }
 
