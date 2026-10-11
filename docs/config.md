@@ -26,6 +26,10 @@ channels:
       key_env: OPENROUTER_API_KEY
     timeout: 120s
     max_retries: 2
+    backoff:
+      base: 250ms
+      max: 2s
+      max_retry_after: 120s
     headers:
       X-Title: tokenmp
 
@@ -100,6 +104,9 @@ models:
 | `channels[].auth.accounts` | 空 | 引用的顶层账号名，与 `auth.key_env` 互斥 |
 | `channels[].timeout` | `120s` | 单次上游请求的整体超时 |
 | `channels[].max_retries` | `0` | 失败后的重试次数 |
+| `channels[].backoff.base` | `250ms` | 第一次重试前的等待时长 |
+| `channels[].backoff.max` | `2s` | 指数退避的上限 |
+| `channels[].backoff.max_retry_after` | `120s` | 上游 `Retry-After` 的上限，超过就不再重试 |
 | `channels[].path` | 按方言 | 覆盖上游路径 |
 | `models[].affinity` | 空 | 渠道亲和的组名，留空表示不参与 |
 | `plugins.dir` | `plugins` | 插件目录 |
@@ -128,9 +135,21 @@ models:
 `max_retries` 只覆盖两类失败：请求没能建立，以及上游返回 408、429、5xx。
 取值上限是 10：转发是同步路径，重试次数乘以超时直接等于客户端等待时长。
 
-重试有两件已知的取舍。一是重试会重发请求体，上游返回 5xx 时那个请求可能已经被
-处理了一半，重发会让它被处理两次；只有在上游保证按请求幂等时才安全。
-二是上游给出的 `Retry-After` 不参与退避，退避按固定指数增长。
+重试的等待取指数退避与上游 `Retry-After` 的较大者。
+第 n 次重试等待 `base × 2^(n-1)`，超过 `max` 按 `max` 算；
+429 与 503 若带 `Retry-After`，等待取两者中的较大值。
+这个头两种写法都认：秒数与 HTTP 日期。缺它时退避与不配退避参数的版本逐条相同。
+
+上游要求的等待超过 `max_retry_after` 时不再重试，把响应交给候选切换，并记一行 WARN。
+不缩短成上限再重试，因为那会让请求早于上游允许的时刻发出，正是要避开的情况。
+默认上限 120s，对齐 openai-python 的 `MAX_RETRY_AFTER_DELAY`。
+`Retry-After` 照旧透传给客户端：客户端看到的是上游给的「什么时候再来」，
+内核做的是「自己什么时候再试」。
+
+退避不做抖动。抖动会改变同账号并发请求的重来时点，是另一个可观测的改动。
+
+重试还会重发请求体。上游返回 5xx 时那个请求可能已经被处理了一半，
+重发会让它被处理两次；只有在上游保证按请求幂等时才安全。
 
 超时的分工要分开说。非流式请求的整体超时覆盖到响应体读完为止。
 流式请求不加整体超时，只压到收到响应头，之后靠调用方的 context 结束。

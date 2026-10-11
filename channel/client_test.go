@@ -400,6 +400,131 @@ func TestClientReportsRetryAfterConnectError(t *testing.T) {
 	}
 }
 
+// TestClientHonorsRetryAfter 覆盖 issue #27 的核心：上游回 429 且带
+// Retry-After 时，两次请求之间至少隔上游要求的时长，回调报出的也是这个值。
+func TestClientHonorsRetryAfter(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if attempts.Add(1) == 1 {
+			writer.Header().Set("Retry-After", "1")
+			writer.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	client, err := channel.NewClient(channel.Spec{
+		Name: "a", Dialect: dialect.OpenAIChat, BaseURL: server.URL, MaxRetries: 2,
+	})
+	if err != nil {
+		t.Fatalf("创建客户端失败: %v", err)
+	}
+	var infos []channel.RetryInfo
+	started := time.Now()
+	response, err := client.Send(context.Background(), channel.Request{
+		Body:    []byte(`{}`),
+		OnRetry: func(info channel.RetryInfo) { infos = append(infos, info) },
+	})
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("重试后应当成功，实际 %d", response.StatusCode)
+	}
+	if len(infos) != 1 || infos[0].Wait != time.Second {
+		t.Fatalf("回调的 Wait 应当是 1s（Retry-After 大于指数退避），实际 %+v", infos)
+	}
+	if elapsed < time.Second {
+		t.Fatalf("两次请求之间应当至少隔 1 秒，实际 %s", elapsed)
+	}
+}
+
+// TestClientStopsWhenRetryAfterExceedsLimit 覆盖 #27 的上限口径：上游要求的等待
+// 超过 max_retry_after 时不再重试，把 429 原样交回调用方，也不触发重试回调。
+// 把它缩短成上限再重试是错的，那会让请求早于上游允许的时刻发出。
+func TestClientStopsWhenRetryAfterExceedsLimit(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		attempts.Add(1)
+		writer.Header().Set("Retry-After", "600")
+		writer.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	client, err := channel.NewClient(channel.Spec{
+		Name:       "a",
+		Dialect:    dialect.OpenAIChat,
+		BaseURL:    server.URL,
+		MaxRetries: 3,
+		Backoff:    channel.Backoff{MaxRetryAfter: 5 * time.Second},
+	})
+	if err != nil {
+		t.Fatalf("创建客户端失败: %v", err)
+	}
+	called := 0
+	response, err := client.Send(context.Background(), channel.Request{
+		Body:    []byte(`{}`),
+		OnRetry: func(channel.RetryInfo) { called++ },
+	})
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("超限时应当把 429 原样交回，实际 %d", response.StatusCode)
+	}
+	if attempts.Load() != 1 {
+		t.Fatalf("超限时不应再发请求，实际 %d 次", attempts.Load())
+	}
+	if called != 0 {
+		t.Fatalf("超限时不应触发重试回调，实际 %d 次", called)
+	}
+}
+
+// TestClientUsesConfiguredBackoff 覆盖 #27 的另一半：退避基础值与上限可配。
+// 配了 base、max 之后单次退避就是按这两个值算出来的。
+func TestClientUsesConfiguredBackoff(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		attempts.Add(1)
+		writer.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	client, err := channel.NewClient(channel.Spec{
+		Name:       "a",
+		Dialect:    dialect.OpenAIChat,
+		BaseURL:    server.URL,
+		MaxRetries: 2,
+		Backoff:    channel.Backoff{Base: 10 * time.Millisecond, Max: 15 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("创建客户端失败: %v", err)
+	}
+	var infos []channel.RetryInfo
+	response, err := client.Send(context.Background(), channel.Request{
+		Body:    []byte(`{}`),
+		OnRetry: func(info channel.RetryInfo) { infos = append(infos, info) },
+	})
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	want := []time.Duration{10 * time.Millisecond, 15 * time.Millisecond}
+	if len(infos) != len(want) {
+		t.Fatalf("应当回调 %d 次，实际 %+v", len(want), infos)
+	}
+	for index, info := range infos {
+		if info.Wait != want[index] {
+			t.Fatalf("第 %d 次回调的 Wait 不符: %v，期望 %v", index+1, info.Wait, want[index])
+		}
+	}
+}
+
 func TestSSEReaderParsesEvents(t *testing.T) {
 	input := ": 注释\n" +
 		"event: message_start\n" +

@@ -220,6 +220,11 @@ func FromConfigWith(cfg *config.Config, logger *slog.Logger, opts ...Option) (*S
 			Timeout:    item.Timeout.Duration(),
 			MaxRetries: retriesOf(item),
 			Headers:    item.Headers,
+			Backoff: channel.Backoff{
+				Base:          item.Backoff.Base.Duration(),
+				Max:           item.Backoff.Max.Duration(),
+				MaxRetryAfter: item.Backoff.MaxRetryAfter.Duration(),
+			},
 		})
 	}
 	channels, err := channel.NewSet(specs)

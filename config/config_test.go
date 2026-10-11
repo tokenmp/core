@@ -313,6 +313,35 @@ channels:
 	}
 }
 
+// TestChannelBackoffParses 覆盖 issue #27 新增的退避键：三个时长能读出来，
+// 写负值在加载时报错并指出 backoff。
+func TestChannelBackoffParses(t *testing.T) {
+	cfg, err := config.Parse(strings.NewReader(`
+channels:
+  - name: a
+    dialect: openai
+    base_url: "https://x"
+    backoff: {base: 100ms, max: 3s, max_retry_after: 30s}
+`))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	item, _ := cfg.ChannelByName("a")
+	if item.Backoff.Base.Duration() != 100*time.Millisecond ||
+		item.Backoff.Max.Duration() != 3*time.Second ||
+		item.Backoff.MaxRetryAfter.Duration() != 30*time.Second {
+		t.Fatalf("退避参数不符: %+v", item.Backoff)
+	}
+
+	_, err = config.Parse(strings.NewReader(`
+channels:
+  - {name: a, dialect: openai, base_url: "https://x", backoff: {base: -1s}}
+`))
+	if err == nil || !strings.Contains(err.Error(), "backoff") {
+		t.Fatalf("负退避时长应当报错并指出 backoff，实际 %v", err)
+	}
+}
+
 // pooled 是一条渠道引用两个账号的最小配置，展开与头合并的用例都用它。
 // team-a 不带头，team-b 带一个与渠道同名的头，用来断言账号覆盖渠道。
 const pooled = `

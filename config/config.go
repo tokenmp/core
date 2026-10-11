@@ -125,6 +125,20 @@ type Channel struct {
 	Timeout    Duration          `yaml:"timeout"`
 	MaxRetries *int              `yaml:"max_retries"`
 	Headers    map[string]string `yaml:"headers"`
+	Backoff    Backoff           `yaml:"backoff"`
+}
+
+// Backoff 是渠道内重试的退避参数。三个字段都可以不写，不写就用内置常量。
+//
+// 上限与 Retry-After 都放在渠道级而不引入全局默认值来源：退避是「这条上游
+// 多久能再收一个请求」的属性，不同上游不一样，与账号、方言无关。
+type Backoff struct {
+	// Base 是第一次重试前的等待时长，第 n 次重试等待 base × 2^(n-1)。
+	Base Duration `yaml:"base"`
+	// Max 是指数退避的上限。
+	Max Duration `yaml:"max"`
+	// MaxRetryAfter 是上游 Retry-After 的上限，超过就不再重试，直接换候选。
+	MaxRetryAfter Duration `yaml:"max_retry_after"`
 }
 
 // Auth 是渠道的鉴权方式。凭据值只从 KeyEnv 指定的环境变量读取，或由 Accounts
@@ -329,6 +343,9 @@ func (c *Config) Validate() error {
 		}
 		if channel.MaxRetries != nil && (*channel.MaxRetries < 0 || *channel.MaxRetries > MaxRetries) {
 			problems = append(problems, fmt.Sprintf("%s: max_retries 须在 0 到 %d 之间", where, MaxRetries))
+		}
+		if channel.Backoff.Base < 0 || channel.Backoff.Max < 0 || channel.Backoff.MaxRetryAfter < 0 {
+			problems = append(problems, where+".backoff: 三个时长都不能为负")
 		}
 		problems = append(problems, checkAuth(where+".auth", channel.Auth, channel.Name)...)
 		for _, name := range channel.Auth.Accounts {

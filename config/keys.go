@@ -53,6 +53,10 @@ var keyDefaults = map[string]string{
 	"channels[].max_retries": "0",
 	"channels[].headers":     "空",
 
+	"channels[].backoff.base":            "250ms",
+	"channels[].backoff.max":             "2s",
+	"channels[].backoff.max_retry_after": "120s",
+
 	"models[].match":    "必填",
 	"models[].channel":  "必填",
 	"models[].upstream": "空（沿用请求的模型名）",

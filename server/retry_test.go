@@ -82,6 +82,46 @@ func TestChannelRetriesAreRecorded(t *testing.T) {
 	}
 }
 
+// TestRetryAfterOverLimitLogsWarning 覆盖 issue #27 的上限口径接线：上游 429 带的
+// Retry-After 超过渠道 backoff.max_retry_after 时只发一次请求，记一行 WARN，
+// 不缩短成上限再重试，随后交给候选切换。
+func TestRetryAfterOverLimitLogsWarning(t *testing.T) {
+	upstreamRecord, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Retry-After", "600")
+		writeJSON(writer, http.StatusTooManyRequests, `{"error":{"message":"rate limited"}}`)
+	})
+	front, logs, _ := newSeamServer(t, fmt.Sprintf(`
+channels:
+  - {name: upstream, dialect: openai, base_url: %q, max_retries: 3, backoff: {max_retry_after: 5s}}
+models:
+  - {match: "client-model", channel: upstream}
+`, upstreamServer.URL))
+
+	status, _, body := post(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`)
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("超限时应当原样返回 429，实际 %d %s", status, body)
+	}
+	if upstreamRecord.count() != 1 {
+		t.Fatalf("超限时上游应当只收到 1 次请求，实际 %d", upstreamRecord.count())
+	}
+
+	lines := waitForLog(t, logs, "请求完成", 1)
+	warn := lineWith(t, lines, "msg", "Retry-After 超过上限，不再重试")
+	assertField(t, warn, "level", "WARN")
+	if got := numberField(t, warn, "status"); got != http.StatusTooManyRequests {
+		t.Fatalf("WARN 行的 status 不符: %v", got)
+	}
+	if got := stringField(t, warn, "retry_after"); got != "600" {
+		t.Fatalf("WARN 行应当记下上游给的值: %v", got)
+	}
+	for _, line := range lines {
+		if line["msg"] == "渠道内重试" {
+			t.Fatalf("超限时不该有渠道内重试行: %v", line)
+		}
+	}
+}
+
 // TestChannelRetriesSilentWhenDisabled 覆盖 max_retries: 0：不重试，Retries 为 0，
 // 一行新增日志都不写。
 func TestChannelRetriesSilentWhenDisabled(t *testing.T) {

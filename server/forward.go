@@ -164,15 +164,26 @@ func (s *Server) callUpstream(
 			accessOf(ctx).recordAttempt(route, 0, FailureConnect, retries, s.now().Sub(started))
 			continue
 		}
-		// Send 返回一个可重试的状态码，说明渠道内的重试次数已经用尽，这里把「为什么
-		// 没再试」补上。max_retries 为 0 时不记：那种情况下一行都不多写。
+		// Send 返回一个可重试的状态码但重试还没用尽，说明上游给的 Retry-After
+		// 超过上限，Send 主动放弃了这次重试。记一行 WARN，方便在访问日志里对上
+		// 「为什么只发了一次」。max_retries 为 0 时不记。
+		// retries 用尽时另记一行 DEBUG。
 		if maxRetries := upstream.Spec().MaxRetries; maxRetries > 0 &&
-			retries >= maxRetries && channel.RetryableStatus(response.StatusCode) {
-			s.logger.Debug("渠道内重试次数已用尽",
-				"request_id", requestIDOf(ctx),
-				"route", routeOf(route),
-				"status", response.StatusCode,
-				"max_retries", maxRetries)
+			channel.RetryableStatus(response.StatusCode) {
+			switch {
+			case retries < maxRetries:
+				s.logger.Warn("Retry-After 超过上限，不再重试",
+					"request_id", requestIDOf(ctx),
+					"route", routeOf(route),
+					"status", response.StatusCode,
+					"retry_after", response.Header.Get("Retry-After"))
+			case retries >= maxRetries:
+				s.logger.Debug("渠道内重试次数已用尽",
+					"request_id", requestIDOf(ctx),
+					"route", routeOf(route),
+					"status", response.StatusCode,
+					"max_retries", maxRetries)
+			}
 		}
 		if response.StatusCode >= http.StatusBadRequest {
 			if shouldTryNext(response.StatusCode, index, len(routes)) {
