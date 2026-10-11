@@ -1,8 +1,8 @@
-# core 的示例配置：两个渠道、一组模型规则、一个插件。
+# core 的示例配置：顶层账号、两条渠道、一组模型规则、一个插件。
 # 复制出去改成自己的渠道即可，凭据只写环境变量名。
 #
-# 两个渠道指向同一个服务只是为了能直接跑起来。真实场景里它们应当是两家不同账号，
-# 这样 models 里的 affinity 才有意义：同一个账号的两把 key 本来就共享提示缓存。
+# 三条候选指向同一个服务只是为了能直接跑起来。真实场景里它们是三个上游账号，
+# 这样 models 里的 affinity 才有意义：同一个 workspace 的凭据本来就共享提示缓存。
 
 listen: 127.0.0.1:8787
 
@@ -10,7 +10,18 @@ log:
   format: text
   level: info
 
+# 顶层账号清单。渠道在 auth.accounts 里按名字引用，一条渠道引用多个账号时展开成
+# 多条候选，让同一段会话粘在其中一条上。账号的头与渠道的头合并，同名时取账号的。
+accounts:
+  - name: team-a
+    key_env: OPENROUTER_KEY_A
+  - name: team-b
+    key_env: OPENROUTER_KEY_B
+    headers:
+      x-account: team-b
+
 channels:
+  # 单账号写法：凭据直接写在渠道上。
   - name: openrouter
     dialect: openai
     base_url: https://openrouter.ai/api/v1
@@ -18,26 +29,30 @@ channels:
     path: /chat/completions
     auth:
       style: bearer
-      key_env: OPENROUTER_API_KEY
+      key_env: OPENROUTER_KEY
     timeout: 120s
 
-  # 第二个账号。没有配 auth，因此指向本地假上游时可以直接跑。
-  - name: backup
+  # 多账号写法：引用顶层账号。展开后是 openrouter-pool/team-a 与
+  # openrouter-pool/team-b 两条渠道，模型规则按账号的声明序展开成多条候选。
+  - name: openrouter-pool
     dialect: openai
     base_url: https://openrouter.ai/api/v1
     path: /chat/completions
+    auth:
+      style: bearer
+      accounts: [team-a, team-b]
 
 models:
   - match: "gpt-*"
     channel: openrouter
   # 组名相同的规则组成一个池。带上会话标识的请求会在池内粘住一条渠道，让上游的
-  # 提示缓存有机会命中。两条都写同一个组名，它们才构成可互换的候选。
+  # 提示缓存有机会命中。三条候选都写同一个组名，它们才构成可互换的候选。
   - match: "claude-*"
     channel: openrouter
-    affinity: accounts
+    affinity: team
   - match: "claude-*"
-    channel: backup
-    affinity: accounts
+    channel: openrouter-pool
+    affinity: team
 
 # 亲和的参数。三个都可选，不写就用默认值。
 affinity:

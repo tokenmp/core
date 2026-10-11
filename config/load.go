@@ -39,21 +39,30 @@ func Load(path string) (*Config, error) {
 }
 
 // Parse 从阅读器解析配置并校验。相对路径保留原样，调用方需要时自行归一。
+//
+// 顶层账号是加载期形态，Parse 会自己调一次 Expand，因此返回值里只剩下展开后的
+// 渠道名，没有账号引用。校验跑两次：第一次看原始写法，账号引用关系（账号是否
+// 存在、有没有人引用）只有在展开之前才看得清；第二次看平铺形态，用来抓展开名
+// 与手写渠道名撞车这类展开之后才出现的重名。见 Config.Expand 的注释。
 func Parse(reader io.Reader) (*Config, error) {
-	var cfg Config
+	var raw Config
 	decoder := yaml.NewDecoder(reader)
 	decoder.KnownFields(true)
-	if err := decoder.Decode(&cfg); err != nil {
+	if err := decoder.Decode(&raw); err != nil {
 		if errors.Is(err, io.EOF) {
 			return nil, errors.New("配置文件为空")
 		}
 		return nil, err
 	}
-	cfg.Defaults()
+	raw.Defaults()
+	if err := raw.Validate(); err != nil {
+		return nil, err
+	}
+	cfg := raw.Expand()
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	return &cfg, nil
+	return cfg, nil
 }
 
 // resolvePaths 把相对路径归一为绝对路径。base 是配置文件所在目录。

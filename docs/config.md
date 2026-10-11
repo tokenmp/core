@@ -50,7 +50,8 @@ plugins:
 ## 条款
 
 凭据只写环境变量名，配置文件里不出现密钥。
-`auth.style` 不是 `none` 时必须给出 `key_env`，缺少时校验失败。
+凭据来源有两种：单账号的渠道写 `key_env`，引用顶层账号的渠道写 `accounts`。
+两者互斥，同一条渠道只能写一个；`auth.style` 不是 `none` 时至少要有一个，都没有时校验失败。
 
 同一个模型可以有多条候选，按配置顺序依次尝试。
 `upstream` 不写就沿用客户端请求的模型名；写了就用配置里的名字，
@@ -87,6 +88,10 @@ models:
 | `listen` | `127.0.0.1:8787` | 监听地址 |
 | `log.format` | `json` | 日志格式 |
 | `log.level` | `info` | 日志级别，同时控制访问日志 |
+| `accounts[].name` | 必填 | 账号名，渠道按它引用 |
+| `accounts[].key_env` | 必填 | 凭据所在的环境变量名 |
+| `accounts[].headers` | 空 | 账号自带的请求头，展开时并入渠道头 |
+| `channels[].auth.accounts` | 空 | 引用的顶层账号名，与 `auth.key_env` 互斥 |
 | `channels[].timeout` | `120s` | 单次上游请求的整体超时 |
 | `channels[].max_retries` | `0` | 失败后的重试次数 |
 | `channels[].path` | 按方言 | 覆盖上游路径 |
@@ -167,7 +172,8 @@ Gemini 的路径含模型名，不支持覆盖。
 
 `Validate` 一次报出全部问题，不是发现第一条就返回。
 它检查日志取值、渠道名重复、方言是否已知、基址协议、超时与重试数量、
-鉴权字段是否齐全、模型规则是否引用了存在的渠道、`upstream` 里的占位符写法。
+鉴权字段是否齐全、账号名与账号引用是否合法、模型规则是否引用了存在的渠道、
+`upstream` 里的占位符写法。
 
 插件目录里是否存在被启用的插件不在校验范围内，由装配阶段检查。
 启用但缺失的插件会让服务启动失败，因为静默降级会让「插件没生效」变成一个
@@ -183,8 +189,11 @@ if err != nil {
 routes := cfg.Resolve("gpt-4o")
 ```
 
-`Load` 依次做四件事：解码、填默认值、把相对路径归一、校验。
-`Parse` 从 `io.Reader` 读取，跳过路径归一那一步，适合测试与嵌入场景。
+`Load` 在 `Parse` 的基础上把相对路径归一成绝对路径。
+`Parse` 从 `io.Reader` 读取，适合测试与嵌入场景，依次做五件事：
+解码、填默认值、校验、调 `Config.Expand` 展开顶层账号、再校验一次。
+第二次校验跑在平铺形态上，用来抓展开名与手写渠道名撞车这类展开之后才出现的重名。
+`Expand` 返回展开后的副本，原对象不改，重复调用也不会把候选数按账号数相乘。
 
 ## 路由解析
 
@@ -194,17 +203,91 @@ routes := cfg.Resolve("gpt-4o")
 通配符只有两个：`*` 匹配任意长度的一段（含 `/` 与 `:`），`?` 匹配一个字符。
 `openai/*` 因此能匹配 `openai/gpt-5`。
 
+## 顶层账号
+
+`accounts` 是顶层的账号清单，每条描述一份凭据。`name` 是账号名，供渠道引用；
+`key_env` 是凭据所在的环境变量名，`headers` 是账号自带的请求头，可以不写。
+
+渠道用 `auth.accounts` 按名字引用账号，写成一个列表。
+它与 `auth.key_env` 互斥：单账号直接写 `key_env`，引用账号的写 `accounts`。
+`auth.style` 留在渠道上，因为同一个凭据字符串在上游怎么用由上游协议决定。
+
+```yaml
+accounts:
+  - name: team-a
+    key_env: ANTHROPIC_KEY_A
+  - name: team-b
+    key_env: ANTHROPIC_KEY_B
+    headers:
+      anthropic-workspace-id: ws-2
+
+channels:
+  - name: anthropic
+    dialect: claude
+    base_url: https://api.anthropic.com
+    auth:
+      style: x-api-key
+      key_env: ANTHROPIC_KEY_A
+
+  - name: anthropic-pool
+    dialect: claude
+    base_url: https://api.anthropic.com
+    auth:
+      style: x-api-key
+      accounts: [team-a, team-b]
+
+models:
+  - match: "claude-*"
+    channel: anthropic-pool
+    affinity: anthropic-team
+```
+
+展开在 `config.Parse` 里做，顺序是先填默认值、校验原始写法、展开、再校验一次平铺形态。
+引用了 N 个账号的渠道展开成 N 条渠道，名字是 `<渠道名>/<账号名>`。
+模型规则引用这样的渠道时，那条规则就地展开成 N 条候选，顺序照 `auth.accounts` 的声明序。
+展开之后 `Config.Resolve`、`server` 与 `channel` 都按平铺形态工作，不感知账号层。
+
+展开之后 `Config` 里不再有账号层：顶层 `accounts` 与渠道的 `auth.accounts` 都不保留，
+每条渠道只留自己的 `key_env`，因此 `Load` 出来的配置可以直接写回文件再次加载。
+程序化构造带账号的配置之后要调一次 `config.Config.Expand`。
+展开只在那里发生，`Validate` 不会替调用方做。
+
+展开时把账号的 `headers` 并入渠道的 `headers`，同名时账号覆盖渠道，
+展开出的多条渠道各自持有一份头，互不影响。
+口径是越具体的越晚写，与 `server.WithUpstreamHeader` 按请求覆盖渠道头一致。
+
+校验期会报出五类账号问题：
+
+- 账号名为空，或两条账号同名。
+- `key_env` 为空。
+- `auth.accounts` 里写了不存在的账号名。
+- `auth.accounts` 与 `auth.key_env` 同时写。
+- 顶层账号没有被任何渠道引用。
+
+`key_env` 对应的环境变量缺失会让服务启动失败，
+与「启用了但目录里不存在的插件让启动失败」是同一条口径。
+账号没有 `enabled` 字段，停用一个账号要先把账号名从引用它的每条 `auth.accounts` 里删掉，
+再删顶层 `accounts` 里的那一行；只删顶层那一行会报「引用了不存在的账号」。
+
+同一段会话会粘在同一个展开出来的渠道上，也就是粘在同一份凭据上。
+上游缓存的隔离范围见「亲和的边界」：放进同一个亲和池的顶层账号应当同属一个上游 workspace。
+否则亲和换来的是跨 workspace 的缓存丢失，收益为负。
+
+一条模型规则展开成 N 条候选之后，重试的等待也会相乘。
+客户端等待的时间上限是候选条数乘以 (1 + `max_retries`) 再乘以 `timeout`。
+账号多的时候应当把每条的 `max_retries` 压到 0 或 1，靠换账号兜底，而不是让同一个账号反复重试。
+
 ## 渠道亲和
 
 同一个模型配了多条候选渠道时，可以让同一段会话的连续请求粘在同一个渠道上。
-上游的提示缓存按账号隔离，会话换渠道就意味着缓存要重建，粘住能省钱。
+上游的提示缓存按 workspace 或 organization 隔离，会话换渠道就意味着缓存要重建，粘住能省钱。
 
 组名相同的候选组成一个池，池里的渠道被当作可互换的：
 
 ```yaml
 models:
-  - {match: "claude-*", channel: account-a, affinity: accounts}
-  - {match: "claude-*", channel: account-b, affinity: accounts}
+  - {match: "claude-*", channel: account-a, affinity: team}
+  - {match: "claude-*", channel: account-b, affinity: team}
   - {match: "*",        channel: fallback}
 ```
 
@@ -273,8 +356,8 @@ core 数不了 token，只能按字节估，中英文混排下 4096 字节约合
 
 三件要知道的限制：
 
-- 上游缓存按 workspace 或 organization 隔离。候选渠道属于同一个账号时，
-  它们本来就共享缓存，此时亲和只是多了一层分配，不带来额外收益。
+- 上游缓存按 workspace 或 organization 隔离。候选渠道属于同一个账号、
+  或引用同一个顶层账号时，它们本来就共享缓存，此时亲和只是多了一层分配，不带来额外收益。
 - 上游的机器落点不归 core 管。OpenAI 的文档写明缓存状态在单台机器上，
   每分钟超过 15 个请求会触发 overflow routing，即使渠道固定也可能落空。
 - 请求头里的标识只在本进程内使用，不会转发给上游。
