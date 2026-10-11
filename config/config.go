@@ -7,10 +7,12 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/tokenmp/core/dialect"
 )
@@ -52,6 +54,27 @@ var (
 	logLevels  = []string{"debug", "info", "warn", "error"}
 	authStyles = []string{"bearer", "x-api-key", "query", "custom", authStyleNone}
 )
+
+// forbiddenPassHeaders 是 pass_headers 里永不放行的头名，按
+// http.CanonicalHeaderKey 归一后的形式存放，比较时也先归一，Authorization 与
+// authorization 因而一视同仁。
+//
+// 前四个是凭据与计费归属，放行等于让客户端决定用谁的钱；content-type 会破坏跨
+// 方言：请求体经过转换之后形状已经变了，客户端给的那个对不上。要按请求给上游加
+// 这些头，走宿主侧的 server.WithUpstreamHeader，凭据仍由渠道的 Auth 决定。
+var forbiddenPassHeaders = []string{
+	"Authorization",
+	"X-Api-Key",
+	"Cookie",
+	"Anthropic-Workspace-Id",
+	"Content-Type",
+}
+
+// ForbiddenPassHeaders 返回 pass_headers 里永不放行的头名，已按
+// http.CanonicalHeaderKey 归一。返回值是副本，调用方改动它不影响校验。
+func ForbiddenPassHeaders() []string {
+	return append([]string(nil), forbiddenPassHeaders...)
+}
 
 // Config 是一份完整的服务配置。
 type Config struct {
@@ -150,7 +173,16 @@ type Channel struct {
 	Timeout    Duration          `yaml:"timeout"`
 	MaxRetries *int              `yaml:"max_retries"`
 	Headers    map[string]string `yaml:"headers"`
-	Backoff    Backoff           `yaml:"backoff"`
+	// PassHeaders 是从客户端转发的请求头白名单，只放行列在这里的名字，其余
+	// 一律不带去上游。放行的信任边界是「这条上游渠道可以收到哪些客户端头」，
+	// 因此放在渠道级而不是方言级：按方言放行会把 Claude 客户端的特性开关带给
+	// 一个它没打算对话的 OpenAI 上游。
+	//
+	// 名单是白名单，不能写成黑名单。禁止放行的头见 ForbiddenPassHeaders，写进
+	// 来会在校验期报错。留着这个口子是因为 anthropic-beta、X-Codex-* 这类头按
+	// 请求变化，静态的 headers 表达不了。
+	PassHeaders []string `yaml:"pass_headers"`
+	Backoff     Backoff  `yaml:"backoff"`
 	// FailoverStatuses 覆盖全局的 retry.failover，空串表示沿用全局。
 	FailoverStatuses string `yaml:"failover_statuses"`
 }
@@ -403,6 +435,7 @@ func (c *Config) Validate() error {
 				}
 			}
 		}
+		problems = append(problems, checkPassHeaders(where, channel.PassHeaders)...)
 		problems = append(problems, checkAuth(where+".auth", channel.Auth, channel.Name)...)
 		for _, name := range channel.Auth.Accounts {
 			if !accounts[name] {
@@ -513,6 +546,35 @@ func checkAffinity(affinity Affinity) []string {
 	}
 	if affinity.MinPrefixBytes != nil && *affinity.MinPrefixBytes < 0 {
 		problems = append(problems, "affinity.min_prefix_bytes 不能为负")
+	}
+	return problems
+}
+
+// checkPassHeaders 校验渠道的客户端头放行名单。
+//
+// 只挡明显写错的：空项、含冒号或空白。严格的 RFC 7230 token 判断在 server 装配
+// 时用 validHeaderName 做，两份规则不抄在一起。禁止名单按
+// http.CanonicalHeaderKey 归一后比较。
+func checkPassHeaders(where string, names []string) []string {
+	var problems []string
+	denied := make(map[string]bool, len(forbiddenPassHeaders))
+	for _, name := range forbiddenPassHeaders {
+		denied[name] = true
+	}
+	for index, name := range names {
+		item := fmt.Sprintf("%s.pass_headers[%d]", where, index)
+		if strings.TrimSpace(name) == "" {
+			problems = append(problems, item+": 头名不能为空")
+			continue
+		}
+		if strings.ContainsRune(name, ':') || strings.IndexFunc(name, unicode.IsSpace) >= 0 {
+			problems = append(problems, fmt.Sprintf("%s: 头名 %q 不能含冒号或空白", item, name))
+			continue
+		}
+		if denied[http.CanonicalHeaderKey(name)] {
+			problems = append(problems, fmt.Sprintf(
+				"%s: 头名 %q 属于不可放行的头（凭据、计费归属或跨方言必需的 Content-Type）", item, name))
+		}
 	}
 	return problems
 }

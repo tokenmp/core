@@ -3,10 +3,12 @@ package server_test
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/tokenmp/core/config"
 	"github.com/tokenmp/core/server"
 )
 
@@ -31,6 +33,44 @@ func postWithHeaders(t *testing.T, url, body string, extra map[string]string) (i
 		t.Fatalf("读取响应失败: %v", err)
 	}
 	return response.StatusCode, payload
+}
+
+// postWithHeaderValues 发一次 POST，同一个头名的多个值都会带上，用来覆盖多值头的转发。
+func postWithHeaderValues(t *testing.T, url, body string, extra http.Header) (int, []byte) {
+	t.Helper()
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("构造请求失败: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	for name, values := range extra {
+		for _, value := range values {
+			request.Header.Add(name, value)
+		}
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	payload, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatalf("读取响应失败: %v", err)
+	}
+	return response.StatusCode, payload
+}
+
+// passHeadersYAML 是一条渠道带客户端头放行名单的最小配置。
+func passHeadersYAML(upstreamURL, entries string) string {
+	return `
+channels:
+  - name: upstream
+    dialect: openai
+    base_url: "` + upstreamURL + `"
+    pass_headers: ` + entries + `
+models:
+  - {match: "client-model", channel: upstream}
+`
 }
 
 // withUpstreamHeaders 返回一段中间件，按顺序挂上给定的上游头。
@@ -198,6 +238,217 @@ models:
 	got := record.last(t).Header
 	if value := got.Get("Authorization"); value != "Bearer channel-secret" {
 		t.Fatalf("鉴权头应当由渠道凭据决定: Authorization=%q", value)
+	}
+}
+
+// TestPassHeadersReachUpstream 覆盖放行名单的正路：名单里的头按请求到达上游，名单外的
+// 照旧不上去。
+func TestPassHeadersReachUpstream(t *testing.T) {
+	record, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, openAIChatResponse)
+	})
+	front, _, _ := newSeamServer(t, passHeadersYAML(upstreamServer.URL,
+		"[anthropic-beta, x-stainless-lang, x-app]"))
+
+	status, body := postWithHeaders(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`,
+		map[string]string{
+			"Anthropic-Beta":   "user-profiles-2025-01-01",
+			"X-Stainless-Lang": "js",
+			"X-App":            "cli",
+			"X-Not-Listed":     "不该上去",
+		})
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d %s", status, body)
+	}
+
+	got := record.last(t).Header
+	for name, want := range map[string]string{
+		"Anthropic-Beta":   "user-profiles-2025-01-01",
+		"X-Stainless-Lang": "js",
+		"X-App":            "cli",
+	} {
+		if value := got.Get(name); value != want {
+			t.Fatalf("名单里的头没到上游: %s=%q，期望 %q", name, value, want)
+		}
+	}
+	if value := got.Get("X-Not-Listed"); value != "" {
+		t.Fatalf("名单外的头不该上去: X-Not-Listed=%q", value)
+	}
+}
+
+// TestPassHeadersForbiddenNotForwarded 钉住不可放行的头即使客户端带着也不上去。
+// Content-Type 单独看一下：内核按渠道给请求体转换后的形状补值，不是没有这个头。
+func TestPassHeadersForbiddenNotForwarded(t *testing.T) {
+	record, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, openAIChatResponse)
+	})
+	front, _, _ := newSeamServer(t, passHeadersYAML(upstreamServer.URL, "[x-app]"))
+
+	status, body := postWithHeaders(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`,
+		map[string]string{
+			"Authorization":          "Bearer client-secret",
+			"X-Api-Key":              "client-key",
+			"Cookie":                 "session=abc",
+			"Anthropic-Workspace-Id": "workspace-7",
+			"Content-Type":           "text/plain",
+			"X-App":                  "cli",
+		})
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d %s", status, body)
+	}
+
+	got := record.last(t).Header
+	for _, name := range []string{"Authorization", "X-Api-Key", "Cookie", "Anthropic-Workspace-Id"} {
+		if value := got.Get(name); value != "" {
+			t.Fatalf("不可放行的头不该上去: %s=%q", name, value)
+		}
+	}
+	if value := got.Get("Content-Type"); value != "application/json" {
+		t.Fatalf("请求体已转换，Content-Type 应当由内核给: %q", value)
+	}
+	if value := got.Get("X-App"); value != "cli" {
+		t.Fatalf("名单里的头没到上游: X-App=%q", value)
+	}
+}
+
+// TestPassHeadersUnsetForwardsNothing 是不写 pass_headers 的对照组：行为与本功能
+// 落地之前相同，客户端头一个都不上去，渠道头照旧。
+func TestPassHeadersUnsetForwardsNothing(t *testing.T) {
+	record, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, openAIChatResponse)
+	})
+	front, _, _ := newSeamServer(t, `
+channels:
+  - name: upstream
+    dialect: openai
+    base_url: "`+upstreamServer.URL+`"
+    headers:
+      X-Channel: from-config
+models:
+  - {match: "client-model", channel: upstream}
+`)
+
+	status, body := postWithHeaders(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`,
+		map[string]string{"Anthropic-Beta": "beta-1", "X-Custom": "client"})
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d %s", status, body)
+	}
+
+	got := record.last(t).Header
+	if value := got.Get("Anthropic-Beta"); value != "" {
+		t.Fatalf("没写名单时客户端头不该上去: Anthropic-Beta=%q", value)
+	}
+	if value := got.Get("X-Custom"); value != "" {
+		t.Fatalf("没写名单时客户端头不该上去: X-Custom=%q", value)
+	}
+	if value := got.Get("X-Channel"); value != "from-config" {
+		t.Fatalf("渠道头不该受影响: X-Channel=%q", value)
+	}
+}
+
+// TestPassHeaderHostWins 钉住优先级：名字同时在放行名单与宿主头里时，宿主按请求设的赢。
+func TestPassHeaderHostWins(t *testing.T) {
+	record, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, openAIChatResponse)
+	})
+	front, _, _ := newSeamServer(t, passHeadersYAML(upstreamServer.URL, "[x-trace-id]"),
+		server.WithMiddleware(withUpstreamHeaders([][2]string{{"X-Trace-Id", "from-host"}})))
+
+	status, body := postWithHeaders(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`,
+		map[string]string{"X-Trace-Id": "from-client"})
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d %s", status, body)
+	}
+
+	got := record.last(t).Header
+	if values := got.Values("X-Trace-Id"); len(values) != 1 || values[0] != "from-host" {
+		t.Fatalf("宿主设的同名头应当赢: X-Trace-Id=%v", values)
+	}
+}
+
+// TestPassHeaderChannelConfigWins 钉住另一层优先级：渠道 headers 比客户端转发的具体。
+func TestPassHeaderChannelConfigWins(t *testing.T) {
+	record, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, openAIChatResponse)
+	})
+	front, _, _ := newSeamServer(t, `
+channels:
+  - name: upstream
+    dialect: openai
+    base_url: "`+upstreamServer.URL+`"
+    headers:
+      X-Title: from-config
+    pass_headers: [x-title]
+models:
+  - {match: "client-model", channel: upstream}
+`)
+
+	status, body := postWithHeaders(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`,
+		map[string]string{"X-Title": "from-client"})
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d %s", status, body)
+	}
+
+	got := record.last(t).Header
+	if values := got.Values("X-Title"); len(values) != 1 || values[0] != "from-config" {
+		t.Fatalf("渠道 headers 应当比客户端转发的具体: X-Title=%v", values)
+	}
+}
+
+// TestPassHeaderMultipleValues 覆盖多值头：同一个头名两个值都原样带上。
+func TestPassHeaderMultipleValues(t *testing.T) {
+	record, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, openAIChatResponse)
+	})
+	front, _, _ := newSeamServer(t, passHeadersYAML(upstreamServer.URL, "[x-multi]"))
+
+	status, body := postWithHeaderValues(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`,
+		http.Header{"X-Multi": {"first", "second"}})
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d %s", status, body)
+	}
+
+	got := record.last(t).Header
+	values := got.Values("X-Multi")
+	if len(values) != 2 || values[0] != "first" || values[1] != "second" {
+		t.Fatalf("多值头应当原样带上: X-Multi=%v", values)
+	}
+}
+
+// TestPassHeaderInvalidNameRejectedAtAssembly 钉住头名合法性的分层：config.Validate
+// 只挡明显写错的，RFC 7230 token 的完整判断在装配时报错，服务启动失败。x(bad) 里的
+// 括号不属于 token 字符集，但 config 不拦它。
+func TestPassHeaderInvalidNameRejectedAtAssembly(t *testing.T) {
+	cfg, err := config.Parse(strings.NewReader(passHeadersYAML("http://127.0.0.1:1", "[x(bad)]")))
+	if err != nil {
+		t.Fatalf("config 不该拦下这一项: %v", err)
+	}
+	if _, err := server.FromConfigWith(cfg, slog.New(slog.DiscardHandler)); err == nil ||
+		!strings.Contains(err.Error(), "不是合法的 HTTP 头名") {
+		t.Fatalf("装配应当报错: %v", err)
+	}
+}
+
+// TestPassHeaderForbiddenRejectedAtAssembly 钉住禁止名单在装配期也拦得住：绕过
+// config.Validate 的程序化配置同样不能把 authorization 放进放行名单。
+func TestPassHeaderForbiddenRejectedAtAssembly(t *testing.T) {
+	cfg := &config.Config{
+		Channels: []config.Channel{{
+			Name:        "upstream",
+			Dialect:     "openai",
+			BaseURL:     "http://127.0.0.1:1",
+			PassHeaders: []string{"authorization"},
+		}},
+	}
+	if _, err := server.FromConfigWith(cfg, slog.New(slog.DiscardHandler)); err == nil ||
+		!strings.Contains(err.Error(), "不可放行") {
+		t.Fatalf("装配应当拒绝禁止放行的头: %v", err)
 	}
 }
 
