@@ -507,6 +507,33 @@ models:
 	}
 }
 
+// TestStreamingPassthroughPreservesIrregularBytes 覆盖非规范写法的 SSE：注释行、
+// data 冒号后不带空格、CRLF 行尾都要原样到达客户端。旁路扫描若借事件读取器回写，
+// 这些都会被归一化掉。
+func TestStreamingPassthroughPreservesIrregularBytes(t *testing.T) {
+	const raw = ": keepalive\ndata:{\"a\":1}\r\n\r\ndata: [DONE]\n\n"
+	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte(raw))
+	})
+	front := newServer(t, `
+channels:
+  - {name: upstream, dialect: openai, base_url: "`+upstreamServer.URL+`"}
+models:
+  - {match: "client-model", channel: upstream}
+`, "")
+
+	status, _, body := post(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","stream":true,"messages":[{"role":"user","content":"你好"}]}`)
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d %s", status, body)
+	}
+	if string(body) != raw {
+		t.Fatalf("非规范 SSE 未被逐字节保留:\n期望 %q\n实际 %q", raw, body)
+	}
+}
+
 func TestStreamingConversion(t *testing.T) {
 	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "text/event-stream")
