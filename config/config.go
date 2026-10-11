@@ -380,7 +380,6 @@ func (c *Config) Validate() error {
 	}
 
 	accounts := make(map[string]bool, len(c.Accounts))
-	referenced := make(map[string]bool, len(c.Accounts))
 	for i, account := range c.Accounts {
 		where := fmt.Sprintf("accounts[%d]", i)
 		if account.Name == "" {
@@ -441,17 +440,10 @@ func (c *Config) Validate() error {
 			if !accounts[name] {
 				problems = append(problems, fmt.Sprintf("%s.auth.accounts: 引用了不存在的账号 %s", where, name))
 			}
-			referenced[name] = true
 		}
 		// 纯内容判断：展开后的渠道两样只剩 KeyEnv，因此平铺形态不会触发。
 		if len(channel.Auth.Accounts) > 0 && channel.Auth.KeyEnv != "" {
 			problems = append(problems, where+".auth.accounts: 与 auth.key_env 互斥，只能写一个")
-		}
-	}
-
-	for i, account := range c.Accounts {
-		if account.Name != "" && !referenced[account.Name] {
-			problems = append(problems, fmt.Sprintf("accounts[%d]: 账号 %s 没有被任何渠道引用", i, account.Name))
 		}
 	}
 
