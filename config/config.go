@@ -5,8 +5,10 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -34,6 +36,11 @@ const (
 	// 大致是一千出头到两千 tokens，落在上游最小可缓存长度（按模型 512 到 4096
 	// tokens）的下半段。它是个启发式，估不准时应当按实际模型调高。
 	DefaultAffinityMinPrefixBytes = 4096
+	// DefaultInChannelStatuses 与 DefaultFailoverStatuses 是两组重试判据的默认
+	// 取值。它们与 channel 包里内置的集合是同一组值：分层红线不允许 config 导入
+	// channel，只能各写一份，改一处要同时改另一处。
+	DefaultInChannelStatuses = "408,429,500,502,503,504"
+	DefaultFailoverStatuses  = "408,401,403,429,500-599"
 )
 
 // authStyleNone 表示不鉴权。单列成常量是因为它在校验里有独立分支。
@@ -63,6 +70,8 @@ type Config struct {
 	Models   []Model   `yaml:"models"`
 	Plugins  Plugins   `yaml:"plugins"`
 	Affinity Affinity  `yaml:"affinity"`
+	// Retry 是重试判据的两组状态码集合。
+	Retry Retry `yaml:"retry"`
 }
 
 // Behavior 是进程级的行为默认值，YAML 里写成 defaults 段。
@@ -104,6 +113,22 @@ type Log struct {
 	Level  string `yaml:"level"`
 }
 
+// Retry 是重试判据的两组状态码集合，都写成逗号分隔的字符串。
+//
+// in_channel 是渠道内原地重试的集合，failover 是换下一条候选的集合。
+// failover 必须包含 in_channel：凡是在渠道内重试过的失败，重试耗尽后还要能降级，
+// 否则会出现「重试了却不换候选」的死角。401 与 403 只在 failover 一侧：它们说明
+// 凭据或权限有问题，同一条渠道原地重试不会变好。
+//
+// 写成字符串而不是 YAML 数组：区间写法（500-599）与混类型数组难写也难校验。
+// 范围是 100 到 599，每项要么是整数，要么是 a-b 且 a <= b。
+type Retry struct {
+	// InChannel 是渠道内原地重试的状态码集合。
+	InChannel string `yaml:"in_channel"`
+	// Failover 是换下一条候选的状态码集合，渠道级 failover_statuses 可以覆盖它。
+	Failover string `yaml:"failover"`
+}
+
 // Account 是一个上游账号。账号不是渠道，渠道在 auth.accounts 里按名字引用它，
 // 加载时展开成多条渠道。单列一层是因为同一把凭据常要配给多种方言或同一上游的多个
 // 入口，写成渠道就得把基址、路径、超时逐条抄一遍。
@@ -125,6 +150,22 @@ type Channel struct {
 	Timeout    Duration          `yaml:"timeout"`
 	MaxRetries *int              `yaml:"max_retries"`
 	Headers    map[string]string `yaml:"headers"`
+	Backoff    Backoff           `yaml:"backoff"`
+	// FailoverStatuses 覆盖全局的 retry.failover，空串表示沿用全局。
+	FailoverStatuses string `yaml:"failover_statuses"`
+}
+
+// Backoff 是渠道内重试的退避参数。三个字段都可以不写，不写就用内置常量。
+//
+// 上限与 Retry-After 都放在渠道级而不引入全局默认值来源：退避是「这条上游
+// 多久能再收一个请求」的属性，不同上游不一样，与账号、方言无关。
+type Backoff struct {
+	// Base 是第一次重试前的等待时长，第 n 次重试等待 base × 2^(n-1)。
+	Base Duration `yaml:"base"`
+	// Max 是指数退避的上限。
+	Max Duration `yaml:"max"`
+	// MaxRetryAfter 是上游 Retry-After 的上限，超过就不再重试，直接换候选。
+	MaxRetryAfter Duration `yaml:"max_retry_after"`
 }
 
 // Auth 是渠道的鉴权方式。凭据值只从 KeyEnv 指定的环境变量读取，或由 Accounts
@@ -290,6 +331,22 @@ func (c *Config) Validate() error {
 	problems = append(problems, checkEnum("log.format", c.Log.Format, logFormats)...)
 	problems = append(problems, checkEnum("log.level", c.Log.Level, logLevels)...)
 
+	// 两组重试判据先在这里解析：渠道级覆盖的包含关系要拿全局的 in_channel 来判。
+	inChannel, inChannelErr := parseStatuses(c.Retry.InChannel, DefaultInChannelStatuses)
+	if inChannelErr != nil {
+		problems = append(problems, "retry.in_channel: "+inChannelErr.Error())
+	}
+	globalFailover, globalFailoverErr := parseStatuses(c.Retry.Failover, DefaultFailoverStatuses)
+	if globalFailoverErr != nil {
+		problems = append(problems, "retry.failover: "+globalFailoverErr.Error())
+	}
+	if inChannelErr == nil && globalFailoverErr == nil && usesGlobalFailover(c.Channels) {
+		if missing, ok := firstMissing(globalFailover, inChannel); ok {
+			problems = append(problems,
+				fmt.Sprintf("retry.failover: 不是 retry.in_channel 的超集，缺少 %d", missing))
+		}
+	}
+
 	accounts := make(map[string]bool, len(c.Accounts))
 	referenced := make(map[string]bool, len(c.Accounts))
 	for i, account := range c.Accounts {
@@ -329,6 +386,22 @@ func (c *Config) Validate() error {
 		}
 		if channel.MaxRetries != nil && (*channel.MaxRetries < 0 || *channel.MaxRetries > MaxRetries) {
 			problems = append(problems, fmt.Sprintf("%s: max_retries 须在 0 到 %d 之间", where, MaxRetries))
+		}
+		if channel.Backoff.Base < 0 || channel.Backoff.Max < 0 || channel.Backoff.MaxRetryAfter < 0 {
+			problems = append(problems, where+".backoff: 三个时长都不能为负")
+		}
+		// 渠道有覆盖时按该渠道的有效集合判，不能只判全局那一对。
+		if strings.TrimSpace(channel.FailoverStatuses) != "" {
+			channelFailover, err := parseStatuses(channel.FailoverStatuses, "")
+			switch {
+			case err != nil:
+				problems = append(problems, where+".failover_statuses: "+err.Error())
+			case inChannelErr == nil:
+				if missing, ok := firstMissing(channelFailover, inChannel); ok {
+					problems = append(problems,
+						fmt.Sprintf("%s.failover_statuses: 不是 retry.in_channel 的超集，缺少 %d", where, missing))
+				}
+			}
 		}
 		problems = append(problems, checkAuth(where+".auth", channel.Auth, channel.Name)...)
 		for _, name := range channel.Auth.Accounts {
@@ -485,6 +558,124 @@ func checkEnum(field, value string, allowed []string) []string {
 		return nil
 	}
 	return []string{fmt.Sprintf("%s: %q 不在允许取值 %s 内", field, value, strings.Join(allowed, "、"))}
+}
+
+// statusSet 是解析出来的状态码集合。
+type statusSet map[int]bool
+
+// parseStatuses 解析 "408,429,500-599" 这样的写法。每项要么是 100 到 599 的整数，
+// 要么是 a-b 且 a <= b。空串或只剩空白时改解析 fallback。
+func parseStatuses(raw, fallback string) (statusSet, error) {
+	if strings.TrimSpace(raw) == "" {
+		raw = fallback
+	}
+	set := statusSet{}
+	for index, item := range strings.Split(raw, ",") {
+		start, end, err := parseStatusItem(strings.TrimSpace(item))
+		if err != nil {
+			return nil, fmt.Errorf("第 %d 项 %w", index+1, err)
+		}
+		for status := start; status <= end; status++ {
+			set[status] = true
+		}
+	}
+	if len(set) == 0 {
+		return nil, errors.New("集合为空")
+	}
+	return set, nil
+}
+
+// parseStatusItem 解析一项，返回它代表的闭区间。
+func parseStatusItem(item string) (int, int, error) {
+	low, high, isRange := strings.Cut(item, "-")
+	start, err := parseStatusNumber(strings.TrimSpace(low))
+	if err != nil {
+		return 0, 0, fmt.Errorf("%q %w", item, err)
+	}
+	if !isRange {
+		return start, start, nil
+	}
+	end, err := parseStatusNumber(strings.TrimSpace(high))
+	if err != nil {
+		return 0, 0, fmt.Errorf("%q %w", item, err)
+	}
+	if start > end {
+		return 0, 0, fmt.Errorf("%q 的区间起点大于终点", item)
+	}
+	return start, end, nil
+}
+
+// parseStatusNumber 解析一个状态码。
+func parseStatusNumber(text string) (int, error) {
+	value, err := strconv.Atoi(text)
+	if err != nil {
+		return 0, errors.New("不是 100 到 599 的整数或 a-b 区间")
+	}
+	if value < 100 || value > 599 {
+		return 0, errors.New("超出 100 到 599")
+	}
+	return value, nil
+}
+
+// usesGlobalFailover 报告有没有渠道沿用全局的 retry.failover。渠道都写了
+// failover_statuses 时全局那一对不参与实际判据，不必强求它是超集。
+func usesGlobalFailover(channels []Channel) bool {
+	if len(channels) == 0 {
+		return true
+	}
+	for _, channel := range channels {
+		if strings.TrimSpace(channel.FailoverStatuses) == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// firstMissing 返回 need 里有而 have 里没有的最小状态码，都包含时第二个值为假。
+func firstMissing(have, need statusSet) (int, bool) {
+	for status := 100; status <= 599; status++ {
+		if need[status] && !have[status] {
+			return status, true
+		}
+	}
+	return 0, false
+}
+
+// statusList 把集合写成升序切片。
+func statusList(set statusSet) []int {
+	statuses := make([]int, 0, len(set))
+	for status := 100; status <= 599; status++ {
+		if set[status] {
+			statuses = append(statuses, status)
+		}
+	}
+	return statuses
+}
+
+// RetryStatuses 返回生效的渠道内重试状态码集合，升序。没写 retry.in_channel
+// 时返回内置默认集合。装配层把它填进每个渠道的 Spec。
+func (c *Config) RetryStatuses() ([]int, error) {
+	set, err := parseStatuses(c.Retry.InChannel, DefaultInChannelStatuses)
+	if err != nil {
+		return nil, fmt.Errorf("retry.in_channel: %w", err)
+	}
+	return statusList(set), nil
+}
+
+// FailoverStatusesFor 返回该渠道生效的换候选状态码集合，升序。渠道写了
+// failover_statuses 就用它，否则用全局的 retry.failover，都没写时用内置默认集合。
+func (c *Config) FailoverStatusesFor(channel Channel) ([]int, error) {
+	raw := channel.FailoverStatuses
+	where := fmt.Sprintf("渠道 %s 的 failover_statuses", channel.Name)
+	if strings.TrimSpace(raw) == "" {
+		raw = c.Retry.Failover
+		where = "retry.failover"
+	}
+	set, err := parseStatuses(raw, DefaultFailoverStatuses)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", where, err)
+	}
+	return statusList(set), nil
 }
 
 // Expand 返回展开顶层账号之后的副本，原对象不改。

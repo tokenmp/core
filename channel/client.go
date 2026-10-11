@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,7 +31,7 @@ const (
 	maxBackoffShift = 6
 )
 
-// retryableStatus 是值得重试的上游状态码。
+// retryableStatus 是 Spec.RetryStatuses 为空时用的内置集合。
 var retryableStatus = map[int]bool{
 	http.StatusRequestTimeout:      true,
 	http.StatusTooManyRequests:     true,
@@ -40,17 +41,46 @@ var retryableStatus = map[int]bool{
 	http.StatusGatewayTimeout:      true,
 }
 
-// RetryableStatus 报告状态码是否属于渠道内会重试的那一类。
+// failoverStatus 是 Spec.FailoverStatuses 为空时用的内置集合。
 //
-// 调用方也用得到这个判断：Send 返回一个可重试的状态码，说明渠道内的重试次数已经
-// 用尽，据此可以解释「为什么没再试」。
+// 它必须包含 retryableStatus：凡是在渠道内重试过的失败，重试耗尽后还要能降级，
+// 否则会出现「重试了却不换候选」的死角。401 与 403 只在换候选这一侧：它们说明
+// 凭据或权限有问题，同一条渠道原地重试不会变好。
+var failoverStatus = buildFailoverStatus()
+
+// buildFailoverStatus 造出内置的换候选集合。
+func buildFailoverStatus() map[int]bool {
+	set := map[int]bool{
+		http.StatusRequestTimeout:  true,
+		http.StatusUnauthorized:    true,
+		http.StatusForbidden:       true,
+		http.StatusTooManyRequests: true,
+	}
+	for status := http.StatusInternalServerError; status <= 599; status++ {
+		set[status] = true
+	}
+	return set
+}
+
+// RetryableStatus 报告状态码是否属于内置的渠道内重试集合。
+//
+// 它是渠道级生效集合的默认值，不是某个渠道的实际判据：实际判据看
+// Client.ShouldRetry，因为配置可以覆盖。
 func RetryableStatus(status int) bool { return retryableStatus[status] }
+
+// FailoverStatus 报告状态码是否属于内置的换候选集合。同样只是默认值，
+// 实际判据看 Client.ShouldFailover。
+func FailoverStatus(status int) bool { return failoverStatus[status] }
 
 // Client 是一个渠道的 HTTP 客户端。可以并发使用。
 type Client struct {
 	spec       Spec
 	http       *http.Client
 	credential string
+	// retryStatuses 与 failoverStatuses 是建客户端时算好的查找表，请求路径上
+	// 不再重算。两者都来自 Spec 的生效集合。
+	retryStatuses    map[int]bool
+	failoverStatuses map[int]bool
 }
 
 // NewClient 创建渠道客户端。凭据在此时从进程环境读一次，读不到直接报错。
@@ -82,11 +112,31 @@ func NewClient(spec Spec) (*Client, error) {
 		ExpectContinueTimeout: time.Second,
 	}
 	return &Client{
-		spec:       spec,
-		http:       &http.Client{Transport: transport},
-		credential: credential,
+		spec:             spec,
+		http:             &http.Client{Transport: transport},
+		credential:       credential,
+		retryStatuses:    statusLookup(spec.RetryStatuses, retryableStatus),
+		failoverStatuses: statusLookup(spec.FailoverStatuses, failoverStatus),
 	}, nil
 }
+
+// statusLookup 把 Spec 里给出的状态码集合变成查找表。集合为空时用内置默认。
+func statusLookup(statuses []int, fallback map[int]bool) map[int]bool {
+	if len(statuses) == 0 {
+		return fallback
+	}
+	set := make(map[int]bool, len(statuses))
+	for _, status := range statuses {
+		set[status] = true
+	}
+	return set
+}
+
+// ShouldRetry 报告这个渠道内是否会对该状态码原地重试。
+func (c *Client) ShouldRetry(status int) bool { return c.retryStatuses[status] }
+
+// ShouldFailover 报告这个渠道返回该状态码时是否值得换下一条候选。
+func (c *Client) ShouldFailover(status int) bool { return c.failoverStatuses[status] }
 
 // Spec 返回渠道描述。
 func (c *Client) Spec() Spec { return c.spec }
@@ -128,7 +178,7 @@ type RetryInfo struct {
 	Attempt int
 	// Status 是触发这次重试的上游状态码。请求没建立时是 0。
 	Status int
-	// Wait 是这次重试之前等待的时长。
+	// Wait 是这次重试之前等待的时长，取指数退避与上游 Retry-After 的较大者。
 	Wait time.Duration
 }
 
@@ -137,6 +187,9 @@ type RetryInfo struct {
 // 重试只覆盖「请求没成功建立」与「上游返回可重试状态」两类情况：连接错误、
 // 408、429、5xx。非流式请求会带上整体超时，流式请求不加，靠
 // ResponseHeaderTimeout 与调用方的 context 控制。
+//
+// 渠道内重试的等待取指数退避与上游 Retry-After 的较大者；429 与 503 给出的
+// Retry-After 超过上限时不再重试，把响应原样交还给调用方，由后者决定换候选。
 func (c *Client) Send(ctx context.Context, req Request) (*http.Response, error) {
 	endpoint, err := c.endpoint(req)
 	if err != nil {
@@ -150,9 +203,14 @@ func (c *Client) Send(ctx context.Context, req Request) (*http.Response, error) 
 	// retryStatus 是上一次尝试触发重试的状态码，连接失败时为 0。回调在退避
 	// 等完之后、真正发出重试之前调用，因此它描述的是这次重试已经等过的时长。
 	retryStatus := 0
+	// pendingRetryAfter 是上一次响应里上游要求的等待时长，在下次重试时并入。
+	pendingRetryAfter := time.Duration(0)
 	for attempt := 0; attempt <= c.spec.MaxRetries; attempt++ {
 		if attempt > 0 {
-			wait := backoffFor(attempt)
+			wait := c.backoffFor(attempt)
+			if pendingRetryAfter > wait {
+				wait = pendingRetryAfter
+			}
 			if err := sleepBackoff(ctx, wait); err != nil {
 				return nil, err
 			}
@@ -164,12 +222,20 @@ func (c *Client) Send(ctx context.Context, req Request) (*http.Response, error) 
 		if err != nil {
 			lastErr = err
 			retryStatus = 0
+			pendingRetryAfter = 0
 			continue
 		}
-		if retryableStatus[response.StatusCode] && attempt < c.spec.MaxRetries {
+		if c.ShouldRetry(response.StatusCode) && attempt < c.spec.MaxRetries {
+			wait := retryAfterWait(response, time.Now())
+			if wait > c.maxRetryAfter() {
+				// 上游要求的等待超过上限：本轮不再重试，把响应原样交回去换候选。
+				// 缩短成上限再重试会让请求早于上游允许的时刻发出，那正是这次要修的事。
+				return response, nil
+			}
 			drainAndClose(response.Body)
 			lastErr = fmt.Errorf("channel: 上游返回 %s", response.Status)
 			retryStatus = response.StatusCode
+			pendingRetryAfter = wait
 			continue
 		}
 		return response, nil
@@ -316,16 +382,70 @@ func (c *Client) applyAuth(request *http.Request) {
 	}
 }
 
-// backoffFor 返回第 attempt 次重试前的等待时长，第 n 次为 base × 2^(n-1)。
-func backoffFor(attempt int) time.Duration {
+// backoffFor 返回第 attempt 次重试前的等待时长，第 n 次为 base × 2^(n-1)，
+// 上限是 max。
+//
+// 不做抖动。抖动会改变同账号并发请求的重来时点，属于另一个可观测的改动，
+// 这次只把上游给出的最小值纳进等待。
+func (c *Client) backoffFor(attempt int) time.Duration {
+	base := c.spec.Backoff.Base
+	if base <= 0 {
+		base = retryBaseBackoff
+	}
+	limit := c.spec.Backoff.Max
+	if limit <= 0 {
+		limit = retryMaxBackoff
+	}
 	if attempt > maxBackoffShift {
 		attempt = maxBackoffShift
 	}
-	backoff := retryBaseBackoff << (attempt - 1)
-	if backoff > retryMaxBackoff {
-		backoff = retryMaxBackoff
+	wait := base
+	for step := 1; step < attempt; step++ {
+		if wait >= limit/2 {
+			return limit
+		}
+		wait *= 2
 	}
-	return backoff
+	if wait > limit {
+		return limit
+	}
+	return wait
+}
+
+// maxRetryAfter 返回本渠道 Retry-After 的上限。
+func (c *Client) maxRetryAfter() time.Duration {
+	if c.spec.Backoff.MaxRetryAfter > 0 {
+		return c.spec.Backoff.MaxRetryAfter
+	}
+	return DefaultMaxRetryAfter
+}
+
+// retryAfterWait 返回上游这次响应要求的等待时长。只认 429 与 503：这两个状态码
+// 带 Retry-After 是合法用法，其余状态码出现它按缺省处理。缺失或不可解析时返回 0，
+// 此时指数退避照旧兜底。
+//
+// 两种格式都认：秒数与 HTTP 日期。日期已经过期时返回 0，同样回到指数退避。
+func retryAfterWait(response *http.Response, now time.Time) time.Duration {
+	if response.StatusCode != http.StatusTooManyRequests &&
+		response.StatusCode != http.StatusServiceUnavailable {
+		return 0
+	}
+	value := strings.TrimSpace(response.Header.Get("Retry-After"))
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		if wait := when.Sub(now); wait > 0 {
+			return wait
+		}
+	}
+	return 0
 }
 
 // sleepBackoff 等待一段退避时间，context 取消时提前返回。

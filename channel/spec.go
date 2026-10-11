@@ -42,6 +42,18 @@ type Auth struct {
 	Query string
 }
 
+// Backoff 是渠道内重试的退避参数。三个字段都可选，零值按内置常量处理，
+// 因此不写这一节时的行为与逐条写死常量的版本相同。
+type Backoff struct {
+	// Base 是第一次重试前的等待时长，第 n 次重试等待 base × 2^(n-1)。
+	Base time.Duration
+	// Max 是指数退避的上限。
+	Max time.Duration
+	// MaxRetryAfter 是上游 Retry-After 的上限。上游要求的等待超过它时不再重试，
+	// 直接交给候选切换；不缩短成上限再重试。
+	MaxRetryAfter time.Duration
+}
+
 // Spec 是一个渠道的完整描述。
 type Spec struct {
 	Name string
@@ -61,10 +73,22 @@ type Spec struct {
 	MaxRetries int
 	// Headers 是附加到每个请求上的头。
 	Headers map[string]string
+	// Backoff 是渠道内重试的退避参数，零值字段按内置常量处理。
+	Backoff Backoff
+	// RetryStatuses 是渠道内重试的状态码集合，由装配层从全局的重试配置填入。
+	// 为空时用包级 RetryableStatus 那个内置集合。
+	RetryStatuses []int
+	// FailoverStatuses 是换下一条候选的状态码集合，只有 server 读它。为空时用
+	// 包级 FailoverStatus 那个内置集合；渠道级配置可以覆盖它。
+	FailoverStatuses []int
 }
 
 // DefaultTimeout 是未指定超时时的取值。
 const DefaultTimeout = 120 * time.Second
+
+// DefaultMaxRetryAfter 是上游 Retry-After 上限的默认值。取值对齐 openai-python
+// 的 MAX_RETRY_AFTER_DELAY：超过它就不再等待重试，交给候选切换。
+const DefaultMaxRetryAfter = 120 * time.Second
 
 // MaxRetries 是重试次数的上限。转发是同步路径，重试次数乘以超时会直接变成
 // 客户端等待时长，因此这里给一个上界而不是放任配置。
@@ -101,6 +125,19 @@ func (s Spec) Validate() error {
 	}
 	if s.MaxRetries < 0 || s.MaxRetries > MaxRetries {
 		return fmt.Errorf("channel: %s 的 max_retries 须在 0 到 %d 之间", s.Name, MaxRetries)
+	}
+	if s.Backoff.Base < 0 || s.Backoff.Max < 0 || s.Backoff.MaxRetryAfter < 0 {
+		return fmt.Errorf("channel: %s 的退避时长不能为负", s.Name)
+	}
+	for _, status := range s.RetryStatuses {
+		if status < 100 || status > 599 {
+			return fmt.Errorf("channel: %s 的 retry_statuses 里 %d 不在 100 到 599 之间", s.Name, status)
+		}
+	}
+	for _, status := range s.FailoverStatuses {
+		if status < 100 || status > 599 {
+			return fmt.Errorf("channel: %s 的 failover_statuses 里 %d 不在 100 到 599 之间", s.Name, status)
+		}
 	}
 	for name, value := range s.Headers {
 		if strings.ContainsAny(name, "\r\n") || strings.ContainsAny(value, "\r\n") {
