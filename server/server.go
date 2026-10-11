@@ -127,6 +127,9 @@ func New(opts Options) (*Server, error) {
 	if opts.Channels == nil {
 		return nil, errors.New("server: Channels 不能为空")
 	}
+	// 直接调 New 的宿主拿到的也应当是平铺配置。亲和三个参数与 config 字段都
+	// 取自这一份，否则同一批渠道名在 Resolve 与 channels.Get 里会对不上。
+	cfg := opts.Config.Expand()
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
@@ -148,7 +151,7 @@ func New(opts Options) (*Server, error) {
 		maxBodyBytes = config.DefaultMaxBodyBytes
 	}
 	server := &Server{
-		config:       opts.Config,
+		config:       cfg,
 		channels:     opts.Channels,
 		plugins:      plugins,
 		engine:       engine,
@@ -156,11 +159,11 @@ func New(opts Options) (*Server, error) {
 		now:          now,
 		maxBodyBytes: maxBodyBytes,
 		affinityTable: affinity.NewTable(
-			opts.Config.AffinityTableSize(),
-			opts.Config.AffinityTTL(),
+			cfg.AffinityTableSize(),
+			cfg.AffinityTTL(),
 			now,
 		),
-		minPrefixBytes:   opts.Config.AffinityMinPrefixBytes(),
+		minPrefixBytes:   cfg.AffinityMinPrefixBytes(),
 		onRequestDone:    opts.OnRequestDone,
 		disableAccessLog: opts.DisableAccessLog,
 	}
@@ -187,15 +190,26 @@ func FromConfig(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 // func(*config.Config, *slog.Logger) (*Server, error) 类型的变量，按仓库的兼容
 // 承诺算破坏性变更。要完全掌控装配就直接用 New。
 func FromConfigWith(cfg *config.Config, logger *slog.Logger, opts ...Option) (*Server, error) {
-	specs := make([]channel.Spec, 0, len(cfg.Channels))
-	for _, item := range cfg.Channels {
+	// cfg 可能是程序化构造的、带顶层账号引用的配置，先展开一次。后面的渠道表、
+	// 插件与 Options.Config 都基于展开后的这一份：宿主与 Resolve 看到的候选名
+	// 必须和 channel.Set 里的键是同一批，否则会报「渠道 X 不存在」。
+	flat := cfg.Expand()
+	specs := make([]channel.Spec, 0, len(flat.Channels))
+	for _, item := range flat.Channels {
 		itemDialect, _ := dialect.Parse(item.Dialect)
 		specs = append(specs, channel.Spec{
-			Name:       item.Name,
-			Dialect:    itemDialect,
-			BaseURL:    item.BaseURL,
-			Path:       item.Path,
-			Auth:       channel.Auth(item.Auth),
+			Name:    item.Name,
+			Dialect: itemDialect,
+			BaseURL: item.BaseURL,
+			Path:    item.Path,
+			// 逐字段列出：config.Auth 多了 accounts 引用，两者不再是可转换的同形
+			// 结构。账号引用在 Expand 里已经展开成 KeyEnv，装配看不到它。
+			Auth: channel.Auth{
+				Style:  item.Auth.Style,
+				KeyEnv: item.Auth.KeyEnv,
+				Header: item.Auth.Header,
+				Query:  item.Auth.Query,
+			},
 			Timeout:    item.Timeout.Duration(),
 			MaxRetries: retriesOf(item),
 			Headers:    item.Headers,
@@ -205,12 +219,12 @@ func FromConfigWith(cfg *config.Config, logger *slog.Logger, opts ...Option) (*S
 	if err != nil {
 		return nil, err
 	}
-	plugins, err := BuildPlugins(cfg, logger)
+	plugins, err := BuildPlugins(flat, logger)
 	if err != nil {
 		return nil, err
 	}
 	options := Options{
-		Config:   cfg,
+		Config:   flat,
 		Channels: channels,
 		Plugins:  plugins,
 		Logger:   logger,

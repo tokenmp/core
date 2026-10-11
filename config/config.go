@@ -45,9 +45,11 @@ var (
 // Config 是一份完整的服务配置。
 type Config struct {
 	// Path 是配置文件的绝对路径，由 Load 填入。Parse 不填。
-	Path     string    `yaml:"-"`
-	Listen   string    `yaml:"listen"`
-	Log      Log       `yaml:"log"`
+	Path   string `yaml:"-"`
+	Listen string `yaml:"listen"`
+	Log    Log    `yaml:"log"`
+	// Accounts 是加载期的顶层账号清单，Expand 之后为空。
+	Accounts []Account `yaml:"accounts"`
 	Channels []Channel `yaml:"channels"`
 	Models   []Model   `yaml:"models"`
 	Plugins  Plugins   `yaml:"plugins"`
@@ -75,6 +77,17 @@ type Log struct {
 	Level  string `yaml:"level"`
 }
 
+// Account 是一个上游账号。账号不是渠道，渠道在 auth.accounts 里按名字引用它，
+// 加载时展开成多条渠道。单列一层是因为同一把凭据常要配给多种方言或同一上游的多个
+// 入口，写成渠道就得把基址、路径、超时逐条抄一遍。
+//
+// Headers 是账号级的附加请求头，用于上游按 workspace 或 organization 隔离的场景。
+type Account struct {
+	Name    string            `yaml:"name"`
+	KeyEnv  string            `yaml:"key_env"`
+	Headers map[string]string `yaml:"headers"`
+}
+
 // Channel 是一个上游渠道。BaseURL 是渠道基址，Path 为空时按方言取默认路径。
 type Channel struct {
 	Name       string            `yaml:"name"`
@@ -87,12 +100,17 @@ type Channel struct {
 	Headers    map[string]string `yaml:"headers"`
 }
 
-// Auth 是渠道的鉴权方式。凭据值只从 KeyEnv 指定的环境变量读取。
+// Auth 是渠道的鉴权方式。凭据值只从 KeyEnv 指定的环境变量读取，或由 Accounts
+// 引用的顶层账号给出。
 type Auth struct {
 	// Style 取 bearer、x-api-key、query、custom 或 none。
 	Style string `yaml:"style"`
 	// KeyEnv 是凭据所在的环境变量名。
 	KeyEnv string `yaml:"key_env"`
+	// Accounts 是引用的顶层账号名，与 KeyEnv 互斥。它也是加载期字段：Expand
+	// 把账号的 KeyEnv 填进展开出的每条渠道，这里随之清空，平铺形态因而与手写
+	// 的等价配置完全一致。
+	Accounts []string `yaml:"accounts"`
 	// Header 是 Style 为 custom 时的请求头名。
 	Header string `yaml:"header"`
 	// Query 是 Style 为 query 时的查询参数名。
@@ -245,6 +263,21 @@ func (c *Config) Validate() error {
 	problems = append(problems, checkEnum("log.format", c.Log.Format, logFormats)...)
 	problems = append(problems, checkEnum("log.level", c.Log.Level, logLevels)...)
 
+	accounts := make(map[string]bool, len(c.Accounts))
+	referenced := make(map[string]bool, len(c.Accounts))
+	for i, account := range c.Accounts {
+		where := fmt.Sprintf("accounts[%d]", i)
+		if account.Name == "" {
+			problems = append(problems, where+": name 不能为空")
+		} else if accounts[account.Name] {
+			problems = append(problems, where+": 账号名 "+account.Name+" 重复")
+		}
+		accounts[account.Name] = true
+		if account.KeyEnv == "" {
+			problems = append(problems, where+": key_env 不能为空")
+		}
+	}
+
 	seen := make(map[string]bool, len(c.Channels))
 	for i, channel := range c.Channels {
 		where := fmt.Sprintf("channels[%d]", i)
@@ -271,6 +304,22 @@ func (c *Config) Validate() error {
 			problems = append(problems, fmt.Sprintf("%s: max_retries 须在 0 到 %d 之间", where, MaxRetries))
 		}
 		problems = append(problems, checkAuth(where+".auth", channel.Auth, channel.Name)...)
+		for _, name := range channel.Auth.Accounts {
+			if !accounts[name] {
+				problems = append(problems, fmt.Sprintf("%s.auth.accounts: 引用了不存在的账号 %s", where, name))
+			}
+			referenced[name] = true
+		}
+		// 纯内容判断：展开后的渠道两样只剩 KeyEnv，因此平铺形态不会触发。
+		if len(channel.Auth.Accounts) > 0 && channel.Auth.KeyEnv != "" {
+			problems = append(problems, where+".auth.accounts: 与 auth.key_env 互斥，只能写一个")
+		}
+	}
+
+	for i, account := range c.Accounts {
+		if account.Name != "" && !referenced[account.Name] {
+			problems = append(problems, fmt.Sprintf("accounts[%d]: 账号 %s 没有被任何渠道引用", i, account.Name))
+		}
 	}
 
 	for i, rule := range c.Models {
@@ -366,7 +415,9 @@ func checkAuth(where string, auth Auth, channel string) []string {
 	if !inEnum(style, authStyles) {
 		return []string{fmt.Sprintf("%s: style %q 不是支持的鉴权方式", where, style)}
 	}
-	if style != authStyleNone && auth.KeyEnv == "" {
+	// 凭据来源有两条：KeyEnv 直接给环境变量名，或 accounts 引用顶层账号。后者的
+	// 环境变量名在展开时逐条填入，因此这里不再要求 KeyEnv。
+	if style != authStyleNone && auth.KeyEnv == "" && len(auth.Accounts) == 0 {
 		problems = append(problems, fmt.Sprintf("%s: 渠道 %s 的鉴权需要 key_env 指定环境变量名", where, channel))
 	}
 	if style == "custom" && auth.Header == "" {
@@ -394,6 +445,107 @@ func checkEnum(field, value string, allowed []string) []string {
 		return nil
 	}
 	return []string{fmt.Sprintf("%s: %q 不在允许取值 %s 内", field, value, strings.Join(allowed, "、"))}
+}
+
+// Expand 返回展开顶层账号之后的副本，原对象不改。
+//
+// 顶层账号是加载期形态，因此这个方法是那条约定的唯一入口：Load 与 Parse 解析
+// 完自己会调一次，从它们拿到的 Config 已经是平铺的。程序化构造带账号的 Config
+// 之后要自己再调一次，否则展开出的渠道没被建出来，渠道的 Auth.KeyEnv 是空的。
+//
+// 展开按内容判断是否还有账号数据：顶层 accounts 为空且没有渠道写 auth.accounts
+// 时直接返回副本。判断基于字段内容而不是调用历史，所以平铺形态再展开不会让
+// 候选数按账号数相乘，同一个对象重复调用结果也一致。
+//
+// 展开会清掉账号层的痕迹：顶层 accounts 与每条渠道的 auth.accounts 都不保留，
+// 所以返回的 Config 能直接序列化后重新加载。
+func (c *Config) Expand() *Config {
+	flat := *c
+	if len(flat.Accounts) == 0 && !referencesAccounts(flat.Channels) {
+		return &flat
+	}
+	byName := make(map[string]Account, len(flat.Accounts))
+	for _, account := range flat.Accounts {
+		byName[account.Name] = account
+	}
+	flat.Accounts = nil
+	// 基础渠道名到展开名的映射。模型规则按基础名查回来，没有账号的渠道不在表里。
+	expandedNames := make(map[string][]string, len(flat.Channels))
+	channels := make([]Channel, 0, len(flat.Channels))
+	for _, channel := range flat.Channels {
+		if len(channel.Auth.Accounts) == 0 {
+			channels = append(channels, channel)
+			continue
+		}
+		names := make([]string, 0, len(channel.Auth.Accounts))
+		for _, name := range channel.Auth.Accounts {
+			account, ok := byName[name]
+			if !ok {
+				// 不存在的引用在 Validate 里已经报错，Parse 走不到这里。
+				// 公开类型仍可能被直接构造，缺账号时跳过比展开成空凭据安全。
+				continue
+			}
+			item := channel
+			item.Name = channel.Name + "/" + account.Name
+			item.Auth.KeyEnv = account.KeyEnv
+			item.Auth.Accounts = nil
+			item.Headers = mergeHeaders(channel.Headers, account.Headers)
+			channels = append(channels, item)
+			names = append(names, item.Name)
+		}
+		if len(names) > 0 {
+			expandedNames[channel.Name] = names
+		}
+	}
+	flat.Channels = channels
+	if len(expandedNames) == 0 {
+		return &flat
+	}
+	models := make([]Model, 0, len(flat.Models))
+	for _, rule := range flat.Models {
+		names, ok := expandedNames[rule.Channel]
+		if !ok {
+			models = append(models, rule)
+			continue
+		}
+		for _, name := range names {
+			item := rule
+			item.Channel = name
+			models = append(models, item)
+		}
+	}
+	flat.Models = models
+	return &flat
+}
+
+// referencesAccounts 报告有没有渠道写 auth.accounts。它是展开幂等判断的一半：
+// 只看字段内容，不做调用历史。
+func referencesAccounts(channels []Channel) bool {
+	for _, channel := range channels {
+		if len(channel.Auth.Accounts) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeHeaders 合并渠道与账号的请求头，同名时账号覆盖渠道。
+//
+// 口径是「越具体越晚写」，与 channel/client.go 里先写 spec.Headers 再写请求头的
+// 覆盖顺序一致。只要任一侧有头就新建 map：展开出的多条渠道若共用同一个 map，
+// 宿主给一条加头会串到它兄弟上。两侧都为空时才返回 nil，不给展开结果塞空 map。
+func mergeHeaders(channel, account map[string]string) map[string]string {
+	if len(channel) == 0 && len(account) == 0 {
+		return nil
+	}
+	merged := make(map[string]string, len(channel)+len(account))
+	for name, value := range channel {
+		merged[name] = value
+	}
+	for name, value := range account {
+		merged[name] = value
+	}
+	return merged
 }
 
 // AffinityTableSize 返回前缀链记忆的条数上限。

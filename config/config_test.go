@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"bytes"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/tokenmp/core/config"
 	"github.com/tokenmp/core/dialect"
+	"gopkg.in/yaml.v3"
 )
 
 const sample = `
@@ -311,6 +313,344 @@ channels:
 	}
 }
 
+// pooled 是一条渠道引用两个账号的最小配置，展开与头合并的用例都用它。
+// team-a 不带头，team-b 带一个与渠道同名的头，用来断言账号覆盖渠道。
+const pooled = `
+accounts:
+  - {name: team-a, key_env: KEY_A}
+  - name: team-b
+    key_env: KEY_B
+    headers: {x-shared: team-b, x-account: team-b}
+
+channels:
+  - name: anthropic-pool
+    dialect: claude
+    base_url: https://api.anthropic.com
+    headers: {x-shared: channel, x-channel-only: keep}
+    auth: {style: x-api-key, accounts: [team-a, team-b]}
+
+models:
+  - {match: "claude-*", channel: anthropic-pool, affinity: team, upstream: "pool/${model}"}
+`
+
+func TestAccountReferencesExpandIntoChannelsAndRoutes(t *testing.T) {
+	cfg, err := config.Parse(strings.NewReader(pooled))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if _, ok := cfg.ChannelByName("anthropic-pool"); ok {
+		t.Fatal("基础渠道名不应留在展开结果里")
+	}
+	if len(cfg.Channels) != 2 {
+		t.Fatalf("两个账号应展开成两条渠道，实际 %d 条", len(cfg.Channels))
+	}
+	for i, want := range []string{"anthropic-pool/team-a", "anthropic-pool/team-b"} {
+		if cfg.Channels[i].Name != want {
+			t.Fatalf("第 %d 条渠道名应为 %s，实际 %s", i, want, cfg.Channels[i].Name)
+		}
+	}
+	first := cfg.Channels[0]
+	if first.Auth.KeyEnv != "KEY_A" || len(first.Auth.Accounts) != 0 {
+		t.Fatalf("展开后只应留下环境变量名，账号引用应清空: %+v", first.Auth)
+	}
+	if cfg.Channels[1].Auth.KeyEnv != "KEY_B" {
+		t.Fatalf("第二个账号的环境变量名不符: %+v", cfg.Channels[1].Auth)
+	}
+	if len(cfg.Accounts) != 0 {
+		t.Fatalf("展开结果里不应留顶层账号: %+v", cfg.Accounts)
+	}
+
+	routes := cfg.Resolve("claude-3-5")
+	if len(routes) != 2 {
+		t.Fatalf("规则应展开成两条候选，实际 %+v", routes)
+	}
+	for i, want := range []string{"anthropic-pool/team-a", "anthropic-pool/team-b"} {
+		if routes[i].Channel != want {
+			t.Fatalf("第 %d 条候选应为 %s，实际 %+v", i, want, routes[i])
+		}
+		if routes[i].Affinity != "team" || routes[i].Upstream != "pool/claude-3-5" {
+			t.Fatalf("第 %d 条候选的其余字段应继承规则: %+v", i, routes[i])
+		}
+	}
+}
+
+func TestAccountHeadersMergeOverChannel(t *testing.T) {
+	cfg, err := config.Parse(strings.NewReader(pooled))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	// team-a 没有头，继承渠道的全部头。
+	without := cfg.Channels[0].Headers
+	if without["x-shared"] != "channel" || without["x-channel-only"] != "keep" {
+		t.Fatalf("账号没写头时渠道头应原样保留: %+v", without)
+	}
+	if _, ok := without["x-account"]; ok {
+		t.Fatalf("账号的头不应串到另一个账号上: %+v", without)
+	}
+	// team-b 覆盖同名头，并且不影响其余渠道头。
+	merged := cfg.Channels[1].Headers
+	if merged["x-shared"] != "team-b" {
+		t.Fatalf("同名的头应取账号的: %+v", merged)
+	}
+	if merged["x-account"] != "team-b" || merged["x-channel-only"] != "keep" {
+		t.Fatalf("合并应保留两边独有的头: %+v", merged)
+	}
+}
+
+func TestExpandedChannelsDoNotShareHeaderMaps(t *testing.T) {
+	// 缺陷回归：两边都没有账号头时，展开出的渠道不能直接共用渠道那份 map，
+	// 否则改一条会串到兄弟上。
+	cfg, err := config.Parse(strings.NewReader(`
+accounts:
+  - {name: team-a, key_env: KEY_A}
+  - {name: team-b, key_env: KEY_B}
+channels:
+  - name: pool
+    dialect: openai
+    base_url: "https://x"
+    headers: {x-shared: channel}
+    auth: {style: bearer, accounts: [team-a, team-b]}
+`))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if len(cfg.Channels) != 2 {
+		t.Fatalf("两个账号应展开成两条渠道: %+v", cfg.Channels)
+	}
+	cfg.Channels[0].Headers["x-added"] = "only-a"
+	if _, ok := cfg.Channels[1].Headers["x-added"]; ok {
+		t.Fatalf("改一条渠道的头不应串到兄弟渠道: %+v", cfg.Channels[1].Headers)
+	}
+}
+
+func TestResolveWithoutAccountsIsUnchanged(t *testing.T) {
+	cfg, err := config.Parse(strings.NewReader(`
+channels:
+  - {name: openrouter, dialect: openai, base_url: "https://x"}
+  - {name: backup, dialect: openai, base_url: "https://y"}
+models:
+  - {match: "claude-*", channel: openrouter, affinity: team}
+  - {match: "claude-*", channel: backup, affinity: team}
+`))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if len(cfg.Channels) != 2 || cfg.Channels[0].Name != "openrouter" || cfg.Channels[1].Name != "backup" {
+		t.Fatalf("不写 accounts 时渠道应原样保留: %+v", cfg.Channels)
+	}
+	if len(cfg.Models) != 2 {
+		t.Fatalf("不写 accounts 时规则应原样保留: %+v", cfg.Models)
+	}
+	routes := cfg.Resolve("claude-3-5")
+	if len(routes) != 2 || routes[0].Channel != "openrouter" || routes[1].Channel != "backup" {
+		t.Fatalf("不写 accounts 时候选与顺序应与手写一致: %+v", routes)
+	}
+	for _, route := range routes {
+		if route.Affinity != "team" {
+			t.Fatalf("候选应继承组名: %+v", route)
+		}
+	}
+}
+
+func TestValidateAccountsProblems(t *testing.T) {
+	const channel = `channels:
+  - {name: c0, dialect: openai, base_url: "https://x"}
+`
+	cases := []struct {
+		name     string
+		yaml     string
+		keywords []string
+	}{
+		{
+			name: "账号名为空",
+			yaml: `accounts:
+  - {name: team-a, key_env: KEY_A}
+  - {name: "", key_env: KEY_B}
+` + channel + `  - {name: c1, dialect: openai, base_url: "https://x", auth: {style: bearer, accounts: [team-a, ""]}}
+`,
+			keywords: []string{"accounts[1]", "name 不能为空"},
+		},
+		{
+			name: "账号名重复",
+			yaml: `accounts:
+  - {name: team-a, key_env: KEY_A}
+  - {name: team-a, key_env: KEY_B}
+` + channel + `  - {name: c1, dialect: openai, base_url: "https://x", auth: {style: bearer, accounts: [team-a]}}
+`,
+			keywords: []string{"accounts[1]", "账号名 team-a 重复"},
+		},
+		{
+			name: "账号缺少 key_env",
+			yaml: `accounts:
+  - {name: team-a, key_env: KEY_A}
+  - {name: team-b}
+` + channel + `  - {name: c1, dialect: openai, base_url: "https://x", auth: {style: bearer, accounts: [team-a, team-b]}}
+`,
+			keywords: []string{"accounts[1]", "key_env 不能为空"},
+		},
+		{
+			name: "引用了不存在的账号",
+			yaml: `accounts:
+  - {name: team-a, key_env: KEY_A}
+` + channel + `  - {name: c1, dialect: openai, base_url: "https://x", auth: {style: bearer, accounts: [team-a, ghost]}}
+`,
+			keywords: []string{"channels[1].auth.accounts", "不存在的账号 ghost"},
+		},
+		{
+			name: "accounts 与 key_env 同时写",
+			yaml: `accounts:
+  - {name: team-a, key_env: KEY_A}
+` + channel + `  - {name: c1, dialect: openai, base_url: "https://x", auth: {style: bearer, key_env: KEY_C, accounts: [team-a]}}
+`,
+			keywords: []string{"channels[1].auth.accounts", "互斥"},
+		},
+		{
+			name: "账号没有被引用",
+			yaml: `accounts:
+  - {name: team-a, key_env: KEY_A}
+  - {name: team-b, key_env: KEY_B}
+` + channel + `  - {name: c1, dialect: openai, base_url: "https://x", auth: {style: bearer, accounts: [team-a]}}
+`,
+			keywords: []string{"accounts[1]", "账号 team-b 没有被任何渠道引用"},
+		},
+	}
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			_, err := config.Parse(strings.NewReader(item.yaml))
+			if err == nil {
+				t.Fatal("应当报错")
+			}
+			for _, keyword := range item.keywords {
+				if !strings.Contains(err.Error(), keyword) {
+					t.Fatalf("错误信息应包含 %q，实际: %v", keyword, err)
+				}
+			}
+		})
+	}
+}
+
+func TestExpandedNameCollisionFailsParse(t *testing.T) {
+	// 展开名与手写渠道名撞车只有展开之后才看得出来，靠二次校验抓。
+	_, err := config.Parse(strings.NewReader(`
+accounts:
+  - {name: team-a, key_env: KEY_A}
+channels:
+  - {name: c0, dialect: openai, base_url: "https://x", auth: {style: bearer, accounts: [team-a]}}
+  - {name: c0/team-a, dialect: openai, base_url: "https://x"}
+`))
+	if err == nil {
+		t.Fatal("展开名与手写渠道名撞车时应当报错")
+	}
+	if !strings.Contains(err.Error(), "重复") {
+		t.Fatalf("错误信息应指出渠道名重复，实际: %v", err)
+	}
+}
+
+func TestExpandedConfigReloads(t *testing.T) {
+	// 缺陷回归：展开后若把账号引用留在渠道上，写回的平铺配置会被「与 key_env 互斥」
+	// 拦下。展开干净的 Config 应当能序列化后原样加载。
+	cfg, err := config.Parse(strings.NewReader(pooled))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("序列化失败: %v", err)
+	}
+	reloaded, err := config.Parse(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("展开结果应当能重新加载: %v", err)
+	}
+	before := cfg.Resolve("claude-3-5")
+	after := reloaded.Resolve("claude-3-5")
+	if len(before) != len(after) {
+		t.Fatalf("重新加载后的候选条数不一致: %d 与 %d", len(before), len(after))
+	}
+	for i := range before {
+		if before[i].Channel != after[i].Channel {
+			t.Fatalf("第 %d 条候选不一致: %s 与 %s", i, before[i].Channel, after[i].Channel)
+		}
+	}
+}
+
+func TestExpandOnHandBuiltConfig(t *testing.T) {
+	// 程序化构造的配置不经 Parse，Expand 是宿主唯一的入口。
+	original := &config.Config{
+		Accounts: []config.Account{
+			{Name: "team-a", KeyEnv: "KEY_A"},
+			{Name: "team-b", KeyEnv: "KEY_B", Headers: map[string]string{"x-account": "team-b"}},
+		},
+		Channels: []config.Channel{{
+			Name:    "pool",
+			Dialect: "claude",
+			BaseURL: "https://api.anthropic.com",
+			Auth:    config.Auth{Style: "x-api-key", Accounts: []string{"team-a", "team-b"}},
+		}},
+		Models: []config.Model{{Match: "claude-*", Channel: "pool"}},
+	}
+
+	flat := original.Expand()
+	if len(flat.Accounts) != 0 {
+		t.Fatalf("展开结果里不应留顶层账号: %+v", flat.Accounts)
+	}
+	if len(flat.Channels) != 2 {
+		t.Fatalf("两个账号应展开成两条渠道，实际 %d 条", len(flat.Channels))
+	}
+	for i, want := range []struct {
+		name   string
+		keyEnv string
+	}{
+		{"pool/team-a", "KEY_A"},
+		{"pool/team-b", "KEY_B"},
+	} {
+		channel := flat.Channels[i]
+		if channel.Name != want.name || channel.Auth.KeyEnv != want.keyEnv {
+			t.Fatalf("第 %d 条渠道不符: %+v", i, channel)
+		}
+		if len(channel.Auth.Accounts) != 0 {
+			t.Fatalf("展开后渠道的账号引用应清空: %+v", channel.Auth)
+		}
+	}
+	if flat.Channels[1].Headers["x-account"] != "team-b" {
+		t.Fatalf("账号的头应并入展开出的渠道: %+v", flat.Channels[1].Headers)
+	}
+	if len(flat.Models) != 2 || flat.Models[0].Channel != "pool/team-a" || flat.Models[1].Channel != "pool/team-b" {
+		t.Fatalf("模型规则应跟渠道一起展开: %+v", flat.Models)
+	}
+
+	// 原对象不改：账号保留，渠道仍是一条且挂着两个引用，规则也仍是一条。
+	if len(original.Accounts) != 2 {
+		t.Fatalf("原配置的账号不应被改动: %+v", original.Accounts)
+	}
+	if len(original.Channels) != 1 || original.Channels[0].Name != "pool" {
+		t.Fatalf("原配置的渠道不应被改动: %+v", original.Channels)
+	}
+	if len(original.Channels[0].Auth.Accounts) != 2 || original.Channels[0].Auth.KeyEnv != "" {
+		t.Fatalf("原配置的账号引用不应被改动: %+v", original.Channels[0].Auth)
+	}
+	if len(original.Models) != 1 {
+		t.Fatalf("原配置的规则不应被改动: %+v", original.Models)
+	}
+}
+
+func TestValidateIsIdempotentAfterExpansion(t *testing.T) {
+	cfg, err := config.Load(filepath.Join("..", "examples", "config.yaml"))
+	if err != nil {
+		t.Fatalf("加载失败: %v", err)
+	}
+	channels, models := len(cfg.Channels), len(cfg.Models)
+	// Load 之后已是平铺形态，再校验与再展开都不应报错，也不应重复展开。
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("展开后的配置应当仍然合法: %v", err)
+	}
+	if again := cfg.Expand(); len(again.Channels) != channels || len(again.Models) != models {
+		t.Fatalf("平铺形态不应再展开: %d 条渠道、%d 条规则", len(again.Channels), len(again.Models))
+	}
+	if len(cfg.Channels) != channels || len(cfg.Models) != models {
+		t.Fatalf("重复校验不应改变展开结果: %d 条渠道、%d 条规则", len(cfg.Channels), len(cfg.Models))
+	}
+}
+
 func TestExampleConfigStaysValid(t *testing.T) {
 	cfg, err := config.Load(filepath.Join("..", "examples", "config.yaml"))
 	if err != nil {
@@ -324,5 +664,19 @@ func TestExampleConfigStaysValid(t *testing.T) {
 	}
 	if routes := cfg.Resolve("gpt-4o"); len(routes) != 1 || routes[0].Channel != "openrouter" {
 		t.Fatalf("示例配置的路由不符: %+v", routes)
+	}
+	// 引用两个账号的渠道展开成两条候选，接在写死的那条后面。
+	claude := cfg.Resolve("claude-3-5")
+	want := []string{"openrouter", "openrouter-pool/team-a", "openrouter-pool/team-b"}
+	if len(claude) != len(want) {
+		t.Fatalf("claude-* 应有三条候选，实际 %+v", claude)
+	}
+	for i, name := range want {
+		if claude[i].Channel != name {
+			t.Fatalf("第 %d 条候选应为 %s，实际 %+v", i, name, claude[i])
+		}
+	}
+	if claude[2].Upstream != "claude-3-5" {
+		t.Fatalf("未写 upstream 应沿用模型名: %+v", claude[2])
 	}
 }
