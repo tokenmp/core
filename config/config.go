@@ -21,6 +21,10 @@ const (
 	DefaultTimeout      = 120 * time.Second
 	DefaultPluginDir    = "plugins"
 	DefaultMaxBodyBytes = 32 << 20
+	// DefaultMaxTokens 是源请求未带 max_tokens 时给 Claude 补的值。它与
+	// relay.DefaultClaudeMaxTokens 是同一个数：分层红线不允许 config 导入 relay，
+	// 只能各写一份，改一处要同时改另一处。
+	DefaultMaxTokens = 4096
 	// MaxRetries 是渠道重试次数的上限，与 channel.MaxRetries 保持一致。
 	MaxRetries = 10
 	// 渠道亲和的参数默认值。
@@ -48,12 +52,35 @@ type Config struct {
 	Path   string `yaml:"-"`
 	Listen string `yaml:"listen"`
 	Log    Log    `yaml:"log"`
+	// Behavior 是 defaults 段，放进程级的行为默认值。
+	//
+	// 字段名不叫 Defaults：Config.Defaults() 已经是公开方法，同名字段与它冲突。
+	// YAML 键固定写作 defaults，那是配置文件里的名字，不随 Go 侧命名走。
+	Behavior Behavior `yaml:"defaults"`
 	// Accounts 是加载期的顶层账号清单，Expand 之后为空。
 	Accounts []Account `yaml:"accounts"`
 	Channels []Channel `yaml:"channels"`
 	Models   []Model   `yaml:"models"`
 	Plugins  Plugins   `yaml:"plugins"`
 	Affinity Affinity  `yaml:"affinity"`
+}
+
+// Behavior 是进程级的行为默认值，YAML 里写成 defaults 段。
+//
+// 两个数都是「装配时读一次、运行期不再变」的进程级参数，因此不塞进渠道或模型
+// 这些既有段：请求体上限属于整个进程，补 max_tokens 是内核的部署级行为。用指针
+// 是为了把「没写」与「显式写成 0」区分开，0 不是合法值，校验会拦下。
+//
+// 内核还有 tool_loss_policy、model_suffix、thinking_adapter 三个行为开关，
+// 这里没有对应的键：前两个会改变「哪个模型名参与匹配」，打开之后 models[].upstream
+// 与 ${model} 的语义跟着变，要另写一节语义说明；tool_loss_policy 等「要不要允许
+// reject」的口径定了再上。在它们落地之前，宿主仍可在 Go 侧构造 relay.Options
+// 注入内核。
+type Behavior struct {
+	// MaxBodyBytes 是客户端请求体的字节上限。
+	MaxBodyBytes *int `yaml:"max_body_bytes"`
+	// DefaultMaxTokens 是源请求未带 max_tokens 时给 Claude 补的值。
+	DefaultMaxTokens *int `yaml:"default_max_tokens"`
 }
 
 // Affinity 是渠道亲和的参数。哪些渠道参与亲和由 Model.Affinity 的组名决定，
@@ -353,6 +380,7 @@ func (c *Config) Validate() error {
 		keys[item.Key] = true
 	}
 
+	problems = append(problems, checkBehavior(c.Behavior)...)
 	problems = append(problems, checkAffinity(c.Affinity)...)
 
 	if len(problems) == 0 {
@@ -385,6 +413,18 @@ func checkUpstream(where, upstream string) []string {
 		}
 		// 跳过 ${name}，避免同一段被重复扫描。
 		i += len("${") + end
+	}
+	return problems
+}
+
+// checkBehavior 校验行为默认值。两个数都是可选的，给了就得为正。
+func checkBehavior(behavior Behavior) []string {
+	var problems []string
+	if behavior.MaxBodyBytes != nil && *behavior.MaxBodyBytes <= 0 {
+		problems = append(problems, "defaults.max_body_bytes 必须为正")
+	}
+	if behavior.DefaultMaxTokens != nil && *behavior.DefaultMaxTokens <= 0 {
+		problems = append(problems, "defaults.default_max_tokens 必须为正")
 	}
 	return problems
 }
@@ -546,6 +586,24 @@ func mergeHeaders(channel, account map[string]string) map[string]string {
 		merged[name] = value
 	}
 	return merged
+}
+
+// MaxBodyBytes 返回请求体的字节上限。没写 defaults.max_body_bytes 时返回
+// DefaultMaxBodyBytes，因此不配置时的行为与逐字段写死默认值的版本一致。
+func (c *Config) MaxBodyBytes() int64 {
+	if c.Behavior.MaxBodyBytes == nil {
+		return DefaultMaxBodyBytes
+	}
+	return int64(*c.Behavior.MaxBodyBytes)
+}
+
+// DefaultMaxTokens 返回源请求未带 max_tokens 时给 Claude 补的值。没写
+// defaults.default_max_tokens 时返回 DefaultMaxTokens。
+func (c *Config) DefaultMaxTokens() int {
+	if c.Behavior.DefaultMaxTokens == nil {
+		return DefaultMaxTokens
+	}
+	return *c.Behavior.DefaultMaxTokens
 }
 
 // AffinityTableSize 返回前缀链记忆的条数上限。

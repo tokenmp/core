@@ -13,6 +13,10 @@ log:
   format: json        # json | text
   level: info         # debug | info | warn | error
 
+defaults:
+  max_body_bytes: 33554432   # 32 MiB，客户端请求体的字节上限
+  default_max_tokens: 4096   # 源请求未带 max_tokens 时给 Claude 补的值
+
 channels:
   - name: openrouter
     dialect: openai   # openai | openai_responses | claude | gemini
@@ -88,6 +92,8 @@ models:
 | `listen` | `127.0.0.1:8787` | 监听地址 |
 | `log.format` | `json` | 日志格式 |
 | `log.level` | `info` | 日志级别，同时控制访问日志 |
+| `defaults.max_body_bytes` | `32MiB` | 客户端请求体的字节上限 |
+| `defaults.default_max_tokens` | `4096` | 源请求未带 `max_tokens` 时给 Claude 补的值 |
 | `accounts[].name` | 必填 | 账号名，渠道按它引用 |
 | `accounts[].key_env` | 必填 | 凭据所在的环境变量名 |
 | `accounts[].headers` | 空 | 账号自带的请求头，展开时并入渠道头 |
@@ -98,7 +104,24 @@ models:
 | `models[].affinity` | 空 | 渠道亲和的组名，留空表示不参与 |
 | `plugins.dir` | `plugins` | 插件目录 |
 | `plugins.list[].order` | `0` | 执行顺序，越小越先执行 |
-| 请求体上限 | `32 MiB` | 客户端请求体的字节上限，不是配置项 |
+
+配置路径写成 `channels[].timeout` 这样的形式，嵌套用点号连接，
+列表在字段名后加 `[]` 再写元素字段；元素是标量的列表路径就到字段名为止。
+`config.Keys()` 返回整份键表的路径、类型与默认值，
+由 `Config` 的字段与 yaml tag 现算，用来生成帮助、模板与字段清单，
+不必再各自抄一份。
+
+`defaults` 段放进程级的行为默认值。两个键都在装配时读一次，之后不再变。
+`max_body_bytes` 不写时是 32 MiB，超限请求以 413 拒绝。
+`default_max_tokens` 不写时是 4096。
+两个值都必须是正整数。
+
+内核另有三个行为开关还没有出口：`tool_loss_policy`、`model_suffix`、
+`thinking_adapter` 都没有对应的 YAML 键。
+`model_suffix` 与 `thinking_adapter` 会改变哪个模型名参与匹配，
+打开之后 `models[].upstream` 与 `${model}` 的语义跟着变，
+要另写一节语义说明；`tool_loss_policy` 的取值口径也未定。
+在它们有键之前，宿主可以在 Go 侧构造 `relay.Options` 注入内核。
 
 `timeout` 写成 `120s` 这样的时长，也可以写成纯数字，按秒解释。
 
@@ -194,6 +217,10 @@ routes := cfg.Resolve("gpt-4o")
 解码、填默认值、校验、调 `Config.Expand` 展开顶层账号、再校验一次。
 第二次校验跑在平铺形态上，用来抓展开名与手写渠道名撞车这类展开之后才出现的重名。
 `Expand` 返回展开后的副本，原对象不改，重复调用也不会把候选数按账号数相乘。
+
+`Parse` 的解码开启 `KnownFields`，配置里出现二进制不认识的键会直接报错，
+而不是被忽略。因此回滚到旧版本之前，要先删掉旧版本不认识的键，
+否则新配置配旧二进制会启动失败。
 
 ## 路由解析
 
