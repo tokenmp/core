@@ -721,15 +721,6 @@ func TestValidateAccountsProblems(t *testing.T) {
 `,
 			keywords: []string{"channels[1].auth.accounts", "互斥"},
 		},
-		{
-			name: "账号没有被引用",
-			yaml: `accounts:
-  - {name: team-a, key_env: KEY_A}
-  - {name: team-b, key_env: KEY_B}
-` + channel + `  - {name: c1, dialect: openai, base_url: "https://x", auth: {style: bearer, accounts: [team-a]}}
-`,
-			keywords: []string{"accounts[1]", "账号 team-b 没有被任何渠道引用"},
-		},
 	}
 	for _, item := range cases {
 		t.Run(item.name, func(t *testing.T) {
@@ -743,6 +734,30 @@ func TestValidateAccountsProblems(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestUnreferencedAccountIsAllowed 验证没人引用的顶层账号不再算错。
+//
+// 账号与引用它的渠道写在同一份文件里，先建账号、再让渠道引用它是自然顺序，
+// 中间那个「账号还在、没人引用」的状态必须能加载，否则一次只改一处的工具
+// 就没法把这件事做完。没人引用的账号在运行时什么都不影响：它不参与展开，
+// 展开之后不留痕迹。
+func TestUnreferencedAccountIsAllowed(t *testing.T) {
+	cfg, err := config.Parse(strings.NewReader(`accounts:
+  - {name: team-a, key_env: KEY_A}
+  - {name: team-b, key_env: KEY_B}
+channels:
+  - {name: c1, dialect: openai, base_url: "https://x", auth: {style: bearer, accounts: [team-a]}}
+`))
+	if err != nil {
+		t.Fatalf("账号没有人引用时不该报错: %v", err)
+	}
+	if len(cfg.Accounts) != 0 {
+		t.Errorf("展开之后不该留下账号层: %+v", cfg.Accounts)
+	}
+	if len(cfg.Channels) != 1 || cfg.Channels[0].Name != "c1/team-a" {
+		t.Errorf("只有被引用的账号展开成渠道: %+v", cfg.Channels)
 	}
 }
 
