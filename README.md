@@ -87,8 +87,9 @@ service, err := server.FromConfigWith(cfg, logger, server.WithRequestDone(func(c
 
 - `FirstByte` 是首次写出**响应体**的时长。流式请求里它就是要算的 TTFT；
   非流式响应是一次写完的，这个值约等于 `Duration`，看不出 TTFT。
-- `Usage` 只在跨方言转发且上游给出用量时非空。同方言透传按字节转发、不解析，
-  流式响应的 TPS 因此算不出来。
+- `Usage` 在上游给出用量时非空。跨方言转发由转换层给，同方言的**流式**透传由内核
+  从上游分片里取（OpenAI 系两种方言）；同方言的非流式透传按字节转发、不解析用量，
+  此时 `Usage` 仍为 nil。
 - 回调同步跑在请求的 goroutine 上，宿主在里面做的耗时工作会算进客户端等待时间里。
   回调返回之后，net/http 会取消这个请求的 context，别在回调里开依赖它的 goroutine。
   它 panic 会被吞掉并记一行 ERROR，不连累别的请求。

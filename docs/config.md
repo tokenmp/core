@@ -304,7 +304,7 @@ pass_headers:
 一次请求的几条日志靠它串起来。
 
 完成行的字段有 `request_id`、`method`、`path`、`status`、`duration`、
-`model`、`channel`、`attempts`。跨方言转发且上游给出用量时另有
+`model`、`channel`、`attempts`。上游给出用量时另有
 `prompt_tokens`、`completion_tokens`、`total_tokens`，有缓存命中时加
 `cached_tokens`，有缓存写入时加 `cache_write_tokens`。
 `prompt_tokens` 已经含缓存读与缓存写，命中率的分母直接用它即可。
@@ -313,8 +313,12 @@ pass_headers:
 只把缓存读报在顶层 `prompt_cache_hit_tokens` 的上游先由转换层搬进 details，
 两种写法在这里是同一个数。
 缓存写把 Claude 的 `cached_creation_tokens` 与 OpenAI 的
-`cache_write_tokens` 合并成一个数，两者都有值时同样取较大者；
-同方言透传时原样转发、不解析用量，所以完成行里也就不会有这些 token 字段。
+`cache_write_tokens` 合并成一个数，两者都有值时同样取较大者。
+
+同方言的流式透传也记用量：内核在按字节转发的旁路里只看 OpenAI 系两种方言分片的
+`data`，命中 `usage` 才解析。Responses 把同一个数报在 `input_tokens` 与
+`output_tokens` 上，记账时与 Chat 那套字段合成一组数。
+同方言的非流式透传不解析用量，完成行里不会有这些 token 字段。
 
 `method`、`path`、`user_agent` 与 `model` 的值来自请求，超过 256 字节时截断，
 末尾的省略号算在这 256 字节之内。`attempts` 是这条请求试过的候选条数，

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -75,16 +76,26 @@ func (s *Server) pipeStream(
 				flusher.Flush()
 			}
 		}
-		if _, err := channel.CopyRaw(writer, response.Body, flush); err != nil {
+		// 搬运继续交给 channel.CopyRaw，本路径不动它一个字节。用量在上游一侧
+		// 旁路扫描：事件读取器会归一化换行、丢掉注释行与未知字段，用它回写就
+		// 不是逐字节透传了，因此扫描必须与写出分开。
+		source := &usageTeeReader{source: response.Body, client: client}
+		if _, err := channel.CopyRaw(writer, source, flush); err != nil {
 			s.logger.Warn("转发上游流失败", "request_id", requestIDOf(ctx), "error", err.Error())
+			return
+		}
+		// 上游没给用量时保持原样，不记 nil。
+		if source.usage != nil {
+			accessOf(ctx).recordUsage(source.usage)
 		}
 		return
 	}
 	reader := channel.NewReader(response.Body)
+	var usage *dto.Usage
 	for {
 		event, err := reader.Next()
 		if errors.Is(err, io.EOF) {
-			return
+			break
 		}
 		if err != nil {
 			s.logger.Warn("读取上游流失败", "request_id", requestIDOf(ctx), "error", err.Error())
@@ -97,11 +108,153 @@ func (s *Server) pipeStream(
 			}
 			continue
 		}
+		// 这条路径本来就在逐条解析，用量顺手取自插件改写之前的原分片。
+		if found := streamUsageOf(client, event.Data); found != nil {
+			usage = found
+		}
 		if err := s.emitEvent(ctx, client, model, event.Name, event.Data, out); err != nil {
 			s.logger.Warn("写出流式事件失败", "request_id", requestIDOf(ctx), "error", err.Error())
 			return
 		}
 	}
+	if usage != nil {
+		accessOf(ctx).recordUsage(usage)
+	}
+}
+
+// streamUsageOf 从一条流式分片里取用量。
+//
+// 只认 OpenAI 系两个方言：Claude 与 Gemini 的用量不以这个形状出现在透传分片里。
+// 透传路径不保证分片是 JSON，解析失败返回 nil，不能因为它让整个请求失败。
+func streamUsageOf(client dialect.Name, data []byte) *dto.Usage {
+	if client != dialect.OpenAIChat && client != dialect.OpenAIResponses {
+		return nil
+	}
+	// 廉价预筛：先找一个精确的字节子串，命中才做完整解析。JSON 字符串里被转义的
+	// 引号写作 \"，所以正文里提到 usage 这个词（写作 \"usage\"）不会命中，
+	// 只有真正的 "usage" 键才会。
+	if !bytes.Contains(data, []byte(`"usage"`)) {
+		return nil
+	}
+	decoded, err := dialect.DecodeStreamResponse(client, data)
+	if err != nil {
+		return nil
+	}
+	switch response := decoded.(type) {
+	case *dto.ChatCompletionsStreamResponse:
+		return response.Usage
+	case *dto.ResponsesStreamResponse:
+		if response.Response == nil {
+			return nil
+		}
+		return response.Response.Usage
+	default:
+		return nil
+	}
+}
+
+// usageTeeReader 把上游流原样交给 channel.CopyRaw，同时旁路扫描 SSE 分片里的用量。
+//
+// Read 返回的字节与读到的完全一致，不改一个字节；扫描只在自己的副本上按 SSE 的
+// 常用子集切出 data 负载，命中 "usage" 时解析一次。usage 只由本次搬运所在的
+// goroutine 写，搬运结束后 pipeStream 读，不需要锁。
+type usageTeeReader struct {
+	source io.Reader
+	client dialect.Name
+	// usage 是扫描到的最新一份用量，上游没给时为 nil。
+	usage *dto.Usage
+	// partial 是尚未见到换行的当前行，data 是当前事件拼接中的 data 负载。
+	partial []byte
+	data    []byte
+	hasData bool
+	// overflow 标记当前事件已经超过扫描上限，后续 data 行不再拼接。
+	overflow bool
+}
+
+// Read 读一段原样返回，并把它交给扫描。
+func (r *usageTeeReader) Read(p []byte) (int, error) {
+	read, err := r.source.Read(p)
+	if read > 0 {
+		r.scan(p[:read])
+	}
+	if err != nil {
+		// 最后一行可能没有换行符，最后一条事件可能没有空行收尾。
+		r.finish()
+	}
+	return read, err
+}
+
+// scan 把这一段按换行切成整行，余下的留在 partial 里等下一段。
+func (r *usageTeeReader) scan(chunk []byte) {
+	for len(chunk) > 0 {
+		index := bytes.IndexByte(chunk, '\n')
+		if index < 0 {
+			r.partial = append(r.partial, chunk...)
+			return
+		}
+		r.partial = append(r.partial, chunk[:index]...)
+		r.line(r.partial)
+		r.partial = r.partial[:0]
+		chunk = chunk[index+1:]
+	}
+}
+
+// line 处理一整行。切分规则与 channel.Reader 对齐：行尾 CR 去掉，冒号开头是
+// 注释，data 行按行拼接，空行分发事件。
+func (r *usageTeeReader) line(raw []byte) {
+	line := bytes.TrimRight(raw, "\r")
+	if len(line) == 0 {
+		r.flush()
+		return
+	}
+	if line[0] == ':' {
+		return
+	}
+	field, value, found := bytes.Cut(line, []byte(":"))
+	if !found {
+		field, value = line, nil
+	}
+	if string(field) != "data" {
+		return
+	}
+	value = bytes.TrimPrefix(value, []byte(" "))
+	if r.overflow {
+		return
+	}
+	// 上限与 channel.Reader 一致：真正的用量分片只有几百字节，这里只是防止
+	// 超长分片（例如内联图片）把整条事件读进内存，反而比原来更吃内存。
+	if len(r.data)+len(value) > channel.DefaultMaxEventBytes {
+		r.overflow = true
+		r.data = r.data[:0]
+		r.hasData = false
+		return
+	}
+	if r.hasData {
+		r.data = append(r.data, '\n')
+	}
+	r.data = append(r.data, value...)
+	r.hasData = true
+}
+
+// flush 收尾一条完整事件，取其中的用量。
+func (r *usageTeeReader) flush() {
+	if r.hasData {
+		if usage := streamUsageOf(r.client, r.data); usage != nil {
+			r.usage = usage
+		}
+	}
+	r.data = r.data[:0]
+	r.hasData = false
+	r.overflow = false
+}
+
+// finish 在流结束时补收尾：把残留的末行与末事件都交给扫描。
+func (r *usageTeeReader) finish() {
+	if len(r.partial) > 0 {
+		r.line(r.partial)
+		r.partial = r.partial[:0]
+	}
+	r.flush()
 }
 
 // convertStream 转发跨方言的上游流。

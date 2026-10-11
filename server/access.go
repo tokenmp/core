@@ -130,11 +130,32 @@ func (r *accessRecord) recordUsage(usage *dto.Usage) {
 		return
 	}
 	r.hasUsage = true
-	r.promptTokens = usage.PromptTokens
-	r.completionTokens = usage.CompletionTokens
+	r.promptTokens = promptTokensOf(usage)
+	r.completionTokens = completionTokensOf(usage)
 	r.totalTokens = usage.TotalTokens
 	r.cachedTokens = cachedTokensOf(usage)
 	r.cacheWriteTokens = cacheWriteTokensOf(usage)
+}
+
+// promptTokensOf 返回提示词 token 数。
+//
+// 同一份用量在两种方言里用不同的顶层字段名报：Chat 那套是 prompt_tokens 与
+// completion_tokens，Responses 那套是 input_tokens 与 output_tokens。记账行与
+// Outcome 要的是一组口径一致的数，因此在记账这一处收口。转换层交出来的用量已经
+// 归一过，两对里只有前一对有值，回退对它是幂等的。
+func promptTokensOf(usage *dto.Usage) int {
+	if usage.PromptTokens > 0 {
+		return usage.PromptTokens
+	}
+	return usage.InputTokens
+}
+
+// completionTokensOf 返回补全 token 数。理由见 promptTokensOf。
+func completionTokensOf(usage *dto.Usage) int {
+	if usage.CompletionTokens > 0 {
+		return usage.CompletionTokens
+	}
+	return usage.OutputTokens
 }
 
 // canonicalUsageOf 取归一之后的用量。

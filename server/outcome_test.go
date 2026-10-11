@@ -141,27 +141,129 @@ models:
 	}
 }
 
-// TestOutcomeWithoutUsageForPassthrough 覆盖同方言透传：不解析用量，Usage 为 nil，
-// 宿主据此知道这次没有账目可记。
-func TestOutcomeWithoutUsageForPassthrough(t *testing.T) {
+// TestOutcomeUsageForStreamingPassthrough 覆盖同方言流式透传：上游在流末给出用量时，
+// 客户端收到的字节不变，宿主的 Outcome 与账目行也拿到 token 数。
+//
+// 用量本来就在上游分片里，只是以前宿主没读。这里同时钉住两件事：旁路扫描不改变报文，
+// 以及记账走的是与跨方言相同的 recordUsage。
+func TestOutcomeUsageForStreamingPassthrough(t *testing.T) {
+	chunks := []string{
+		`{"id":"1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"你"}}]}`,
+		`{"id":"1","object":"chat.completion.chunk","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":42,"completion_tokens":226,"total_tokens":268}}`,
+	}
 	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
-		writeJSON(writer, http.StatusOK, openAIChatResponse)
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		for _, chunk := range chunks {
+			_, _ = writer.Write([]byte("data: " + chunk + "\n\n"))
+		}
+		_, _ = writer.Write([]byte("data: [DONE]\n\n"))
 	})
-	front, outcomes := newOutcomeServer(t, `
+	front, logs, outcomes := newSeamServer(t, `
 channels:
   - {name: upstream, dialect: openai, base_url: "`+upstreamServer.URL+`"}
 models:
   - {match: "client-model", channel: upstream}
 `)
 
-	status, _, _ := post(t, front.URL+"/v1/chat/completions",
-		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`)
+	status, _, body := post(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","stream":true,"messages":[{"role":"user","content":"你好"}]}`)
 	if status != http.StatusOK {
-		t.Fatalf("状态码不符: %d", status)
+		t.Fatalf("状态码不符: %d %s", status, body)
+	}
+	// 旁路扫描只读不写，报文必须逐字节保留。
+	expected := "data: " + chunks[0] + "\n\ndata: " + chunks[1] + "\n\ndata: [DONE]\n\n"
+	if string(body) != expected {
+		t.Fatalf("流式透传未被逐字节保留:\n期望 %q\n实际 %q", expected, body)
+	}
+
+	outcome := outcomes.wait(t, 1)[0]
+	if outcome.Usage == nil {
+		t.Fatalf("流末给出用量时 Outcome.Usage 不该是 nil: %+v", outcome)
+	}
+	if outcome.Usage.PromptTokens != 42 || outcome.Usage.CompletionTokens != 226 || outcome.Usage.TotalTokens != 268 {
+		t.Fatalf("用量不符: %+v", outcome.Usage)
+	}
+
+	line := onlyLine(t, waitForLog(t, logs, "请求完成", 1), "请求完成")
+	if got := numberField(t, line, "prompt_tokens"); got != 42 {
+		t.Fatalf("账目行 prompt_tokens 不符: %v（完成行 %v）", got, line)
+	}
+	if got := numberField(t, line, "completion_tokens"); got != 226 {
+		t.Fatalf("账目行 completion_tokens 不符: %v（完成行 %v）", got, line)
+	}
+	if got := numberField(t, line, "total_tokens"); got != 268 {
+		t.Fatalf("账目行 total_tokens 不符: %v（完成行 %v）", got, line)
+	}
+}
+
+// TestOutcomeWithoutUsageWhenUpstreamOmitsIt 覆盖上游流末不给用量：旁路扫描不到就
+// 保持 Usage 为 nil，账目行也不出现 token 字段。
+func TestOutcomeWithoutUsageWhenUpstreamOmitsIt(t *testing.T) {
+	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte(`data: {"id":"1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"你"}}]}` + "\n\n"))
+		_, _ = writer.Write([]byte("data: [DONE]\n\n"))
+	})
+	front, logs, outcomes := newSeamServer(t, `
+channels:
+  - {name: upstream, dialect: openai, base_url: "`+upstreamServer.URL+`"}
+models:
+  - {match: "client-model", channel: upstream}
+`)
+
+	status, _, body := post(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","stream":true,"messages":[{"role":"user","content":"你好"}]}`)
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d %s", status, body)
 	}
 	outcome := outcomes.wait(t, 1)[0]
 	if outcome.Usage != nil {
-		t.Fatalf("同方言透传不解析用量，Usage 应当是 nil: %+v", outcome.Usage)
+		t.Fatalf("上游没给用量时 Usage 应当是 nil: %+v", outcome.Usage)
+	}
+	line := onlyLine(t, waitForLog(t, logs, "请求完成", 1), "请求完成")
+	if _, ok := line["prompt_tokens"]; ok {
+		t.Fatalf("没有用量时账目行不该出现 token 字段: %v", line)
+	}
+}
+
+// TestOutcomeUsageForResponsesStreamingPassthrough 覆盖 /v1/responses 这条同方言
+// 透传：用量挂在 response.completed 分片的 response.usage 下。
+//
+// Responses 的原始用量用 input_tokens/output_tokens，而 recordUsage 读的是
+// prompt_tokens/completion_tokens，这里只钉住取到的是同一份用量（total_tokens），
+// 字段形状的差异不在本次改动范围内。
+func TestOutcomeUsageForResponsesStreamingPassthrough(t *testing.T) {
+	event := `{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":11,"output_tokens":22,"total_tokens":33}}}`
+	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		_, _ = writer.Write([]byte("event: response.completed\ndata: " + event + "\n\n"))
+	})
+	front, _, outcomes := newSeamServer(t, `
+channels:
+  - {name: upstream, dialect: openai_responses, base_url: "`+upstreamServer.URL+`"}
+models:
+  - {match: "client-model", channel: upstream}
+`)
+
+	status, _, body := post(t, front.URL+"/v1/responses",
+		`{"model":"client-model","stream":true,"input":"你好"}`)
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d %s", status, body)
+	}
+	outcome := outcomes.wait(t, 1)[0]
+	if outcome.Usage == nil {
+		t.Fatalf("Responses 流给出用量时 Usage 不该是 nil: %+v", outcome)
+	}
+	if outcome.Usage.TotalTokens != 33 {
+		t.Fatalf("Responses 用量不符: %+v", outcome.Usage)
+	}
+	// Responses 把提示词与补全报在 input_tokens 与 output_tokens 上，记账要把它
+	// 与 Chat 那套 prompt_tokens 与 completion_tokens 合成一组数，否则 tps 会算成 0。
+	if outcome.Usage.PromptTokens != 11 || outcome.Usage.CompletionTokens != 22 {
+		t.Fatalf("Responses 的提示词与补全 token 数应当归一到 PromptTokens 与 CompletionTokens: %+v", outcome.Usage)
 	}
 }
 
