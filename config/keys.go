@@ -49,9 +49,10 @@ var keyDefaults = map[string]string{
 	"channels[].auth.header":   "空",
 	"channels[].auth.query":    "空",
 
-	"channels[].timeout":     "120s",
-	"channels[].max_retries": "0",
-	"channels[].headers":     "空",
+	"channels[].timeout":      "120s",
+	"channels[].max_retries":  "0",
+	"channels[].headers":      "空",
+	"channels[].pass_headers": "空",
 
 	"channels[].backoff.base":            "250ms",
 	"channels[].backoff.max":             "2s",

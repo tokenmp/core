@@ -67,8 +67,9 @@ type Options struct {
 	//
 	// 装在外侧：宿主加进 context 的值会一路传下去，OnRequestDone 的 ctx 里有它。
 	//
-	// 改请求头不会传到上游：上游请求头来自渠道配置与 `Auth`，内核不从进来的请求里抄。
-	// 要按请求加上游头，在中间件里调 WithUpstreamHeader 往 ctx 上挂。
+	// 改请求头默认不会传到上游：只有渠道 pass_headers 名单里的头会跟随，其余请求头
+	// 与 Auth 都由内核按渠道配置决定。要按请求加上游头，在中间件里调
+	// WithUpstreamHeader 往 ctx 上挂。
 	//
 	// 包装 http.ResponseWriter 时必须把 Flush 转发下去，否则流式响应会静默退化成
 	// 不刷新。
@@ -116,6 +117,9 @@ type Server struct {
 	requestCounter atomic.Uint64
 	// affinityTable 记住「请求前缀 → 渠道」，供没有会话标识的客户端兜底。
 	affinityTable *affinity.Table
+	// passHeaders 是渠道名到客户端头白名单的查找表，键与名单里的名字都已归一。
+	// 名单为空的渠道不在表里。
+	passHeaders map[string]map[string]bool
 	// minPrefixBytes 是前缀的字节下限，短于它时不做亲和。零表示不判断。
 	minPrefixBytes int
 	// onRequestDone 是宿主的请求结束回调，为 nil 表示不回调。
@@ -171,6 +175,7 @@ func New(opts Options) (*Server, error) {
 			now,
 		),
 		minPrefixBytes:   cfg.AffinityMinPrefixBytes(),
+		passHeaders:      buildPassHeaders(cfg.Channels, logger),
 		onRequestDone:    opts.OnRequestDone,
 		disableAccessLog: opts.DisableAccessLog,
 	}
@@ -201,6 +206,11 @@ func FromConfigWith(cfg *config.Config, logger *slog.Logger, opts ...Option) (*S
 	// 插件与 Options.Config 都基于展开后的这一份：宿主与 Resolve 看到的候选名
 	// 必须和 channel.Set 里的键是同一批，否则会报「渠道 X 不存在」。
 	flat := cfg.Expand()
+	// pass_headers 的严格头名判断在装配时做：config.Validate 只挡明显写错的，
+	// RFC 7230 token 的判断留在 server，两份规则不抄在一起。
+	if err := checkPassHeaders(flat.Channels); err != nil {
+		return nil, err
+	}
 	// 重试判据的生效集合在这里解析一次：in_channel 对所有渠道相同，failover
 	// 按渠道解析，渠道级 failover_statuses 覆盖全局的 retry.failover。
 	retryStatuses, err := flat.RetryStatuses()

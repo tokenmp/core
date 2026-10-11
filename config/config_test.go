@@ -266,6 +266,51 @@ channels:
 	}
 }
 
+func TestValidatePassHeaders(t *testing.T) {
+	// 名单里只放行显式列出的名字，因此禁止项必须在校验期就报错，而不是静默丢掉。
+	configWith := func(entries string) string {
+		return `
+channels:
+  - {name: a, dialect: openai, base_url: "https://x", pass_headers: ` + entries + `}
+`
+	}
+	cases := []struct {
+		name    string
+		entries string
+		keyword string
+	}{
+		{name: "合法名单", entries: "[anthropic-beta, x-stainless-lang, x-app]"},
+		{name: "空项", entries: `[anthropic-beta, ""]`, keyword: "不能为空"},
+		{name: "含冒号", entries: `[anthropic-beta, "x:a"]`, keyword: "冒号"},
+		{name: "含空白", entries: `[anthropic-beta, "x a"]`, keyword: "空白"},
+		{name: "禁止 authorization", entries: "[authorization]", keyword: "不可放行"},
+		{name: "禁止的大小写变体", entries: "[X-API-KEY]", keyword: "不可放行"},
+		{name: "禁止 cookie", entries: "[Cookie]", keyword: "不可放行"},
+		{name: "禁止 anthropic-workspace-id", entries: "[anthropic-workspace-id]", keyword: "不可放行"},
+		{name: "禁止 content-type", entries: "[Content-Type]", keyword: "不可放行"},
+	}
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			_, err := config.Parse(strings.NewReader(configWith(item.entries)))
+			if item.keyword == "" {
+				if err != nil {
+					t.Fatalf("应当通过: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("应当报错")
+			}
+			if !strings.Contains(err.Error(), item.keyword) {
+				t.Fatalf("错误信息应包含 %q，实际: %v", item.keyword, err)
+			}
+			if !strings.Contains(err.Error(), "pass_headers[") {
+				t.Fatalf("错误信息应指到具体那一项，实际: %v", err)
+			}
+		})
+	}
+}
+
 func TestMatchWildcards(t *testing.T) {
 	cases := []struct {
 		pattern string
