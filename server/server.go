@@ -41,13 +41,18 @@ type Options struct {
 	Channels *channel.Set
 	// Plugins 是插件集合，为 nil 时视为没有插件。
 	Plugins *plugin.Store
-	// Engine 是转换内核，为 nil 时按配置构造。
+	// Engine 是转换内核，为 nil 时用零值内核。
+	//
+	// 零值内核不带任何行为开关。按配置构造内核是 FromConfigWith 的事：它把
+	// defaults 段的默认值翻成 relay.Options 再注入这里。这个字段留给直接调 New
+	// 的宿主自己注入内核，New 不读配置。
 	Engine *relay.Engine
 	// Logger 是日志入口，为 nil 时丢弃日志。
 	Logger *slog.Logger
 	// Now 返回当前时间，为 nil 时用 time.Now。
 	Now func() time.Time
 	// MaxBodyBytes 是单个请求体的上限，为 0 时用 config.DefaultMaxBodyBytes。
+	// FromConfigWith 会先把它填成配置里 defaults.max_body_bytes 的生效值。
 	MaxBodyBytes int64
 	// OnRequestDone 在每次请求结束时同步调用，交出这次请求的原始量。
 	//
@@ -136,6 +141,8 @@ func New(opts Options) (*Server, error) {
 	}
 	engine := opts.Engine
 	if engine == nil {
+		// 直接调 New 的宿主没给内核：只拿零值内核，行为开关一律用 relay 的默认值。
+		// 按配置构造内核由 FromConfigWith 完成，那里才知道 defaults 段。
 		engine = relay.NewEngine(relay.Options{})
 	}
 	plugins := opts.Plugins
@@ -228,6 +235,15 @@ func FromConfigWith(cfg *config.Config, logger *slog.Logger, opts ...Option) (*S
 		Channels: channels,
 		Plugins:  plugins,
 		Logger:   logger,
+		// 行为默认值在这里从配置读一次，翻成运行期的值。relay.Options 的字段保持
+		// 原样由装配层填，内核不读配置；Options.MaxBodyBytes 也在这里拿到。
+		//
+		// 两个键都填成生效值而不是「没写就留零值」：配置的默认值与 relay、config
+		// 两处的默认常量是同一个数，填进去与让下游自己回退结果相同，填了才能断言
+		// 装配出来的内核真的带着配置。选项在默认值之后套用，宿主要换内核可以传一个
+		// 自定义 Option 覆盖回来。
+		Engine:       relay.NewEngine(relay.Options{DefaultMaxTokens: func(string) int { return flat.DefaultMaxTokens() }}),
+		MaxBodyBytes: flat.MaxBodyBytes(),
 	}
 	for _, apply := range opts {
 		// nil 当空操作：宿主用变量拼选项时递进来 nil 不该让装配炸掉。
