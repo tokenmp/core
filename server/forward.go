@@ -60,7 +60,7 @@ func (s *Server) forward(writer http.ResponseWriter, request *http.Request, clie
 	}
 	plan := s.planAffinity(request, client, body, routes)
 
-	response, prepared, route := s.callUpstream(ctx, writer, client, model, stream, body, plan.routes)
+	response, prepared, route := s.callUpstream(ctx, writer, request, client, model, stream, body, plan.routes)
 	if response == nil {
 		return
 	}
@@ -109,6 +109,7 @@ func usableRoutes(routes []config.Route) ([]config.Route, string) {
 func (s *Server) callUpstream(
 	ctx context.Context,
 	writer http.ResponseWriter,
+	request *http.Request,
 	client dialect.Name,
 	model string,
 	stream bool,
@@ -116,7 +117,7 @@ func (s *Server) callUpstream(
 	routes []config.Route,
 ) (*http.Response, *relay.Prepared, config.Route) {
 	// 宿主按请求设的上游头只取一次，候选换渠道时不变。
-	headers := s.upstreamHeaders(ctx)
+	hostHeaders := s.upstreamHeaders(ctx)
 	var lastMessage string
 	for index, route := range routes {
 		started := s.now()
@@ -126,6 +127,7 @@ func (s *Server) callUpstream(
 			accessOf(ctx).recordAttempt(route, 0, FailureChannel, 0, s.now().Sub(started))
 			continue
 		}
+		headers := s.forwardHeaders(request, route.Channel, upstream.Spec().Headers, hostHeaders)
 		prepared, err := s.engine.PrepareRequest(ctx, relay.Request{
 			From:          client,
 			To:            route.Dialect,
@@ -216,6 +218,47 @@ func (s *Server) callUpstream(
 	accessOf(ctx).served("")
 	s.writeError(ctx, writer, http.StatusBadGateway, "upstream_error", lastMessage)
 	return nil, nil, config.Route{}
+}
+
+// forwardHeaders 组装这次上游请求的头，优先级从低到高是：客户端按渠道放行名单
+// 转发的头、渠道 headers、宿主 WithUpstreamHeader 设的头。也就是「越具体越晚写」，
+// 与 channel/attempt 里先写 spec.Headers 再写请求级头是同一条口径。
+//
+// 名单里的头把客户端的所有值都带上：http.Header 支持多值，Cookie 这类重复字段的
+// 头是合法写法。名单为空的渠道只带渠道头与宿主头，与没有放行功能时逐条相同。
+func (s *Server) forwardHeaders(
+	request *http.Request,
+	channelName string,
+	channelHeaders map[string]string,
+	host http.Header,
+) http.Header {
+	var out http.Header
+	if allowed := s.passHeaders[channelName]; len(allowed) > 0 {
+		for name, values := range request.Header {
+			if !allowed[name] {
+				continue
+			}
+			if out == nil {
+				out = make(http.Header, len(allowed))
+			}
+			out[name] = append([]string(nil), values...)
+		}
+	}
+	// 渠道头比客户端转发的具体，同名时渠道赢，所以在这里覆盖。
+	for name, value := range channelHeaders {
+		if out == nil {
+			out = make(http.Header, len(channelHeaders))
+		}
+		out.Set(name, value)
+	}
+	// 宿主按请求设的最具体，最后写。
+	for name, values := range host {
+		if out == nil {
+			out = make(http.Header, len(host))
+		}
+		out[name] = append([]string(nil), values...)
+	}
+	return out
 }
 
 // writeUpstream 把上游响应写回客户端。

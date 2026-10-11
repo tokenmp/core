@@ -36,6 +36,11 @@ channels:
       max_retry_after: 120s
     headers:
       X-Title: tokenmp
+    # 从客户端转发的请求头白名单，只放行列出的名字。
+    pass_headers:
+      - anthropic-beta
+      - x-stainless-lang
+      - x-app
 
   - name: local
     dialect: claude
@@ -115,6 +120,7 @@ models:
 | `channels[].backoff.max` | `2s` | 指数退避的上限 |
 | `channels[].backoff.max_retry_after` | `120s` | 上游 `Retry-After` 的上限，超过就不再重试 |
 | `channels[].path` | 按方言 | 覆盖上游路径 |
+| `channels[].pass_headers` | 空 | 从客户端转发的请求头白名单，空表示一个都不转发 |
 | `models[].affinity` | 空 | 渠道亲和的组名，留空表示不参与 |
 | `plugins.dir` | `plugins` | 插件目录 |
 | `plugins.list[].order` | `0` | 执行顺序，越小越先执行 |
@@ -193,9 +199,91 @@ Gemini 的路径含模型名，不支持覆盖。
 `headers` 是渠道级的附加请求头，每个请求都带上。宿主在中间件里用
 `server.WithUpstreamHeader` 设的同名头按请求覆盖它，覆盖后只发一条，其余渠道头
 照旧；覆盖是按名字整个替换，宿主读不到这里的原值，想两个值都保留得自己拼。
-鉴权头是例外，它由 `Auth` 最后写入，覆盖不了。客户端自带的请求头不会被
-转发，只有宿主在这里明确设置的头才会上游。一个名字只带一个值，名字按
+鉴权头是例外，它由 `Auth` 最后写入，覆盖不了。一个名字只带一个值，名字按
 `http.CanonicalHeaderKey` 归一后比较，重复字段的头表达不了。
+
+## 客户端请求头
+
+渠道构造上游请求时不碰客户端发来的请求头，`authorization`、`x-api-key` 这类
+凭据因此不会漏给上游。但 `anthropic-beta`、`OpenAI-Beta`、`X-Codex-*` 这些头
+按请求变化，静态的 `headers` 表达不了，漏掉它们会让上游按不同功能开关对待请求。
+渠道级键 `pass_headers` 是一份白名单，名单里的头按请求跟上去，名单外的照旧不转发：
+
+```yaml
+channels:
+  - name: anthropic
+    dialect: claude
+    base_url: https://api.anthropic.com
+    pass_headers: [anthropic-beta, x-stainless-lang, x-app]
+```
+
+名单放在渠道级，不放在方言级。放行的信任边界是「这条上游渠道可以收到哪些客户端
+头」，不是「客户端是什么方言」。按方言放行会把 Claude 客户端的特性开关带给一个
+它没打算对话的 OpenAI 上游。名单为空时行为与没有这个键时逐条相同。
+
+只能写白名单，不能反过写成黑名单：新出的协议头默认不转发，要放行得显式加名字。
+
+这五个头永远不放行，写进 `pass_headers` 会在校验期报错，报错指到那一项：
+`authorization`、`x-api-key`、`cookie`、`anthropic-workspace-id`、`content-type`。
+前四个是凭据与计费归属，放行等于让客户端决定用谁的钱；`content-type` 会破坏
+跨方言，请求体经过转换之后形状已经变了，客户端给的那个对不上。判断按
+`http.CanonicalHeaderKey` 归一后的名字做，`Authorization` 与 `authorization`
+一视同仁。要按请求给上游加 `anthropic-workspace-id`，用宿主侧的
+`server.WithUpstreamHeader`，或写进顶层账号的 `headers`。
+
+同名头的优先级从低到高是：客户端按名单转发来的头、渠道 `headers`、
+宿主 `WithUpstreamHeader` 设的头。也就是越具体越晚写，宿主赢，渠道 `headers`
+赢过客户端转发的同名头。转发按 `http.Header` 的多值语义走，名单里的头把客户端的
+所有值都带上，`Cookie` 这类重复字段的头是合法写法。
+
+两份可以直接复制的推荐名单，数据来自中转层 new-api 的按客户端透传清单。
+Claude Code：
+
+```yaml
+pass_headers:
+  - anthropic-beta
+  - anthropic-version
+  - anthropic-dangerous-direct-browser-access
+  - x-app
+  - user-agent
+  - x-stainless-arch
+  - x-stainless-lang
+  - x-stainless-os
+  - x-stainless-package-version
+  - x-stainless-retry-count
+  - x-stainless-runtime
+  - x-stainless-runtime-version
+  - x-stainless-timeout
+```
+
+Codex：
+
+```yaml
+pass_headers:
+  - originator
+  - session_id
+  - thread_id
+  - session-id
+  - thread-id
+  - x-client-request-id
+  - user-agent
+  - x-codex-beta-features
+  - x-codex-turn-state
+  - x-codex-turn-metadata
+  - x-codex-window-id
+  - x-codex-parent-thread-id
+  - x-openai-subagent
+  - x-openai-memgen-request
+  - x-responsesapi-include-timing-metrics
+  - x-openai-internal-codex-responses-lite
+```
+
+不要把 `accept-encoding` 放进名单。Go 只在它自己加这个头时才自动解压响应，显式
+转发会让上游压缩，而流式读取拿到的是压缩字节。
+
+两件事不在这个键的范围里。客户端的 query 串不转发，任意转发会把 `?api_key=`
+这类凭据一起带上去，要做也得先定白名单口径。内核也不自己补
+`anthropic-version` 这类「协议必需的头」，它已经能用渠道 `headers` 写死表达。
 
 ## 访问日志
 
@@ -254,7 +342,11 @@ Gemini 的路径含模型名，不支持覆盖。
 `Validate` 一次报出全部问题，不是发现第一条就返回。
 它检查日志取值、渠道名重复、方言是否已知、基址协议、超时与重试数量、
 重试判据的取值范围与包含关系、鉴权字段是否齐全、账号名与账号引用是否合法、
-模型规则是否引用了存在的渠道、`upstream` 里的占位符写法。
+`pass_headers` 里有没有禁止放行的项、模型规则是否引用了存在的渠道、
+`upstream` 里的占位符写法。
+
+`pass_headers` 的头名判断分两层：加载期只挡明显写错的（空项、含冒号或空白），
+严格的 RFC 7230 token 判断在装配时做，不合格时服务启动失败。
 
 插件目录里是否存在被启用的插件不在校验范围内，由装配阶段检查。
 启用但缺失的插件会让服务启动失败，因为静默降级会让「插件没生效」变成一个
