@@ -24,7 +24,9 @@ type Outcome struct {
 
 	// Status 是写回客户端的状态码。处理器没有显式写响应头时按 200 记，与访问日志一致。
 	Status int
-	// Duration 是从请求进入中间件到处理器返回的时长，含重试与等待上游的全部时间。
+	// Duration 是从请求进入中间件到处理器返回的时长，含渠道内重试的退避、换候选与
+	// 等待上游的全部时间。不拆成几段：宿主算服务时长要的就是客户端实际等了多久，
+	// 拆开之后还得自己加回去，反而多一处会算错的地方。
 	Duration time.Duration
 	// FirstByte 是从请求进入中间件到首次写出响应体的时长，也就是 core 能测到的 TTFT。
 	// 整个请求没有写出过响应体时为 0。
@@ -59,7 +61,11 @@ type Attempt struct {
 	Status int
 	// Failure 是没拿到上游响应的原因，Status 非 0 时恒为 FailureNone。
 	Failure Failure
-	// Duration 是这次尝试的耗时，从选定候选算到拿到响应头或失败。
+	// Retries 是这条候选内部的渠道内重试次数，0 表示没有重试。它回答「上游实际
+	// 多收了几次请求」，与路由级的 attempts 不是一回事。
+	Retries int
+	// Duration 是这次尝试的耗时，从选定候选算到拿到响应头或失败。含这条候选内部
+	// 的全部退避等待。
 	Duration time.Duration
 }
 

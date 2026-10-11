@@ -40,6 +40,12 @@ var retryableStatus = map[int]bool{
 	http.StatusGatewayTimeout:      true,
 }
 
+// RetryableStatus 报告状态码是否属于渠道内会重试的那一类。
+//
+// 调用方也用得到这个判断：Send 返回一个可重试的状态码，说明渠道内的重试次数已经
+// 用尽，据此可以解释「为什么没再试」。
+func RetryableStatus(status int) bool { return retryableStatus[status] }
+
 // Client 是一个渠道的 HTTP 客户端。可以并发使用。
 type Client struct {
 	spec       Spec
@@ -110,6 +116,20 @@ type Request struct {
 	// 覆盖是请求级比渠道级更具体的结果：同一个头只发一条，不会两条并存。
 	// 渠道的鉴权头不在此列，它在最后按 Auth 写入。
 	Header http.Header
+	// OnRetry 在每次渠道内重试之前调用，为 nil 时什么也不做。它在调用方的
+	// goroutine 上同步执行，channel 不加锁也不缓存：重试是这次调用的事实，
+	// 交给调用方决定怎么记账。
+	OnRetry func(RetryInfo)
+}
+
+// RetryInfo 是一次渠道内重试的事实。
+type RetryInfo struct {
+	// Attempt 是第几次重试，从 1 开始。第一次请求不算重试。
+	Attempt int
+	// Status 是触发这次重试的上游状态码。请求没建立时是 0。
+	Status int
+	// Wait 是这次重试之前等待的时长。
+	Wait time.Duration
 }
 
 // Send 发送请求并返回响应。响应体由调用方关闭。
@@ -127,20 +147,29 @@ func (c *Client) Send(ctx context.Context, req Request) (*http.Response, error) 
 		method = http.MethodPost
 	}
 	var lastErr error
+	// retryStatus 是上一次尝试触发重试的状态码，连接失败时为 0。回调在退避
+	// 等完之后、真正发出重试之前调用，因此它描述的是这次重试已经等过的时长。
+	retryStatus := 0
 	for attempt := 0; attempt <= c.spec.MaxRetries; attempt++ {
 		if attempt > 0 {
-			if err := sleepBackoff(ctx, attempt); err != nil {
+			wait := backoffFor(attempt)
+			if err := sleepBackoff(ctx, wait); err != nil {
 				return nil, err
+			}
+			if req.OnRetry != nil {
+				req.OnRetry(RetryInfo{Attempt: attempt, Status: retryStatus, Wait: wait})
 			}
 		}
 		response, err := c.attempt(ctx, method, endpoint, req)
 		if err != nil {
 			lastErr = err
+			retryStatus = 0
 			continue
 		}
 		if retryableStatus[response.StatusCode] && attempt < c.spec.MaxRetries {
 			drainAndClose(response.Body)
 			lastErr = fmt.Errorf("channel: 上游返回 %s", response.Status)
+			retryStatus = response.StatusCode
 			continue
 		}
 		return response, nil
@@ -287,8 +316,8 @@ func (c *Client) applyAuth(request *http.Request) {
 	}
 }
 
-// sleepBackoff 按指数退避等待，context 取消时提前返回。
-func sleepBackoff(ctx context.Context, attempt int) error {
+// backoffFor 返回第 attempt 次重试前的等待时长，第 n 次为 base × 2^(n-1)。
+func backoffFor(attempt int) time.Duration {
 	if attempt > maxBackoffShift {
 		attempt = maxBackoffShift
 	}
@@ -296,7 +325,12 @@ func sleepBackoff(ctx context.Context, attempt int) error {
 	if backoff > retryMaxBackoff {
 		backoff = retryMaxBackoff
 	}
-	timer := time.NewTimer(backoff)
+	return backoff
+}
+
+// sleepBackoff 等待一段退避时间，context 取消时提前返回。
+func sleepBackoff(ctx context.Context, wait time.Duration) error {
+	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
