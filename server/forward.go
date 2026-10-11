@@ -122,7 +122,7 @@ func (s *Server) callUpstream(
 		upstream, ok := s.channels.Get(route.Channel)
 		if !ok {
 			lastMessage = fmt.Sprintf("渠道 %s 不存在", route.Channel)
-			accessOf(ctx).recordAttempt(route, 0, FailureChannel, s.now().Sub(started))
+			accessOf(ctx).recordAttempt(route, 0, FailureChannel, 0, s.now().Sub(started))
 			continue
 		}
 		prepared, err := s.engine.PrepareRequest(ctx, relay.Request{
@@ -136,31 +136,53 @@ func (s *Server) callUpstream(
 		if err != nil {
 			lastMessage = err.Error()
 			s.logger.Warn("请求转换失败", "request_id", requestIDOf(ctx), "route", routeOf(route), "error", err.Error())
-			accessOf(ctx).recordAttempt(route, 0, FailureConvert, s.now().Sub(started))
+			accessOf(ctx).recordAttempt(route, 0, FailureConvert, 0, s.now().Sub(started))
 			continue
 		}
+		// retries 由渠道内重试的回调累计。回调同步跑在这段代码所在的 goroutine 上，
+		// 因此 Send 返回时读它是安全的，不需要锁。
+		retries := 0
 		response, err := upstream.Send(ctx, channel.Request{
 			Dialect: route.Dialect,
 			Model:   route.Upstream,
 			Stream:  prepared.Stream,
 			Body:    prepared.Body,
 			Header:  headers,
+			OnRetry: func(info channel.RetryInfo) {
+				retries = info.Attempt
+				s.logger.Debug("渠道内重试",
+					"request_id", requestIDOf(ctx),
+					"route", routeOf(route),
+					"retry", info.Attempt,
+					"status", info.Status,
+					"wait", info.Wait)
+			},
 		})
 		if err != nil {
 			lastMessage = err.Error()
 			s.logger.Warn("上游请求失败", "request_id", requestIDOf(ctx), "route", routeOf(route), "error", err.Error())
-			accessOf(ctx).recordAttempt(route, 0, FailureConnect, s.now().Sub(started))
+			accessOf(ctx).recordAttempt(route, 0, FailureConnect, retries, s.now().Sub(started))
 			continue
+		}
+		// Send 返回一个可重试的状态码，说明渠道内的重试次数已经用尽，这里把「为什么
+		// 没再试」补上。max_retries 为 0 时不记：那种情况下一行都不多写。
+		if maxRetries := upstream.Spec().MaxRetries; maxRetries > 0 &&
+			retries >= maxRetries && channel.RetryableStatus(response.StatusCode) {
+			s.logger.Debug("渠道内重试次数已用尽",
+				"request_id", requestIDOf(ctx),
+				"route", routeOf(route),
+				"status", response.StatusCode,
+				"max_retries", maxRetries)
 		}
 		if response.StatusCode >= http.StatusBadRequest {
 			if shouldTryNext(response.StatusCode, index, len(routes)) {
 				lastMessage = readErrorBody(response)
 				s.logger.Warn("上游拒绝请求，改试下一条路由", "request_id", requestIDOf(ctx), "route", routeOf(route), "status", response.StatusCode)
-				accessOf(ctx).recordAttempt(route, response.StatusCode, FailureNone, s.now().Sub(started))
+				accessOf(ctx).recordAttempt(route, response.StatusCode, FailureNone, retries, s.now().Sub(started))
 				continue
 			}
 			// 不可重试的状态，或已经是最后一条候选：原样交给调用方。
-			accessOf(ctx).recordAttempt(route, response.StatusCode, FailureNone, s.now().Sub(started))
+			accessOf(ctx).recordAttempt(route, response.StatusCode, FailureNone, retries, s.now().Sub(started))
 			accessOf(ctx).served(route.Channel)
 			return response, prepared, route
 		}
@@ -171,7 +193,7 @@ func (s *Server) callUpstream(
 				"count", len(prepared.Diagnostics()),
 				"diagnostics", prepared.Diagnostics())
 		}
-		accessOf(ctx).recordAttempt(route, response.StatusCode, FailureNone, s.now().Sub(started))
+		accessOf(ctx).recordAttempt(route, response.StatusCode, FailureNone, retries, s.now().Sub(started))
 		accessOf(ctx).served(route.Channel)
 		return response, prepared, route
 	}

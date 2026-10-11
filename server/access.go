@@ -100,7 +100,8 @@ func (r *accessRecord) served(channel string) {
 }
 
 // recordAttempt 记下一次候选尝试。没拿到上游响应时 status 为 0，原因看 failure。
-func (r *accessRecord) recordAttempt(route config.Route, status int, failure Failure, duration time.Duration) {
+// retries 是这条候选内部的渠道内重试次数，与路由级的 attempts 无关。
+func (r *accessRecord) recordAttempt(route config.Route, status int, failure Failure, retries int, duration time.Duration) {
 	if r == nil {
 		return
 	}
@@ -110,6 +111,7 @@ func (r *accessRecord) recordAttempt(route config.Route, status int, failure Fai
 		Upstream: route.Upstream,
 		Status:   status,
 		Failure:  failure,
+		Retries:  retries,
 		Duration: duration,
 	})
 }

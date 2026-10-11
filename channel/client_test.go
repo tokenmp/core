@@ -295,6 +295,111 @@ func TestClientDoesNotRetryClientError(t *testing.T) {
 	}
 }
 
+// TestClientReportsEveryRetry 覆盖 issue #25 要的口径：每次渠道内重试都通过
+// OnRetry 交出来，Attempt 从 1 开始，Status 是触发重试的状态码，Wait 是退避时长。
+func TestClientReportsEveryRetry(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		attempts.Add(1)
+		writer.WriteHeader(http.StatusTooManyRequests)
+		_, _ = writer.Write([]byte(`{"error":"rate limited"}`))
+	}))
+	defer server.Close()
+
+	client, err := channel.NewClient(channel.Spec{
+		Name: "a", Dialect: dialect.OpenAIChat, BaseURL: server.URL, MaxRetries: 3,
+	})
+	if err != nil {
+		t.Fatalf("创建客户端失败: %v", err)
+	}
+	var infos []channel.RetryInfo
+	response, err := client.Send(context.Background(), channel.Request{
+		Body:    []byte(`{}`),
+		OnRetry: func(info channel.RetryInfo) { infos = append(infos, info) },
+	})
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("重试耗尽时应当把 429 原样返回，实际 %d", response.StatusCode)
+	}
+	if attempts.Load() != 4 {
+		t.Fatalf("max_retries: 3 时上游应收到 4 次请求，实际 %d", attempts.Load())
+	}
+	wantWaits := []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second}
+	if len(infos) != len(wantWaits) {
+		t.Fatalf("应当回调 %d 次，实际 %d: %+v", len(wantWaits), len(infos), infos)
+	}
+	for index, info := range infos {
+		if info.Attempt != index+1 {
+			t.Fatalf("第 %d 次回调的 Attempt 不符: %d", index+1, info.Attempt)
+		}
+		if info.Status != http.StatusTooManyRequests {
+			t.Fatalf("第 %d 次回调的 Status 不符: %d", index+1, info.Status)
+		}
+		if info.Wait != wantWaits[index] {
+			t.Fatalf("第 %d 次回调的 Wait 不符: %v，期望 %v", index+1, info.Wait, wantWaits[index])
+		}
+	}
+}
+
+// TestClientWithoutRetriesDoesNotCallBack 覆盖 max_retries: 0：一次重试都不发，
+// 回调一次都不触发。
+func TestClientWithoutRetriesDoesNotCallBack(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		attempts.Add(1)
+		writer.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+
+	client, err := channel.NewClient(channel.Spec{
+		Name: "a", Dialect: dialect.OpenAIChat, BaseURL: server.URL, MaxRetries: 0,
+	})
+	if err != nil {
+		t.Fatalf("创建客户端失败: %v", err)
+	}
+	called := 0
+	response, err := client.Send(context.Background(), channel.Request{
+		Body:    []byte(`{}`),
+		OnRetry: func(channel.RetryInfo) { called++ },
+	})
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if attempts.Load() != 1 {
+		t.Fatalf("max_retries: 0 时上游只应收到 1 次请求，实际 %d", attempts.Load())
+	}
+	if called != 0 {
+		t.Fatalf("max_retries: 0 时不该触发重试回调，实际 %d 次", called)
+	}
+}
+
+// TestClientReportsRetryAfterConnectError 覆盖请求没建立的情况：没有状态码可报，
+// Status 为 0，回调照常触发。
+func TestClientReportsRetryAfterConnectError(t *testing.T) {
+	client, err := channel.NewClient(channel.Spec{
+		Name: "a", Dialect: dialect.OpenAIChat, BaseURL: "http://127.0.0.1:1", MaxRetries: 1,
+	})
+	if err != nil {
+		t.Fatalf("创建客户端失败: %v", err)
+	}
+	var infos []channel.RetryInfo
+	response, err := client.Send(context.Background(), channel.Request{
+		Body:    []byte(`{}`),
+		OnRetry: func(info channel.RetryInfo) { infos = append(infos, info) },
+	})
+	if err == nil {
+		_ = response.Body.Close()
+		t.Fatal("连不上上游时应当报错")
+	}
+	if len(infos) != 1 || infos[0].Attempt != 1 || infos[0].Status != 0 {
+		t.Fatalf("连接失败的重试回调不符: %+v", infos)
+	}
+}
+
 func TestSSEReaderParsesEvents(t *testing.T) {
 	input := ": 注释\n" +
 		"event: message_start\n" +

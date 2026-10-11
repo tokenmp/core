@@ -184,6 +184,12 @@ Gemini 的路径含模型名，不支持覆盖。
 末尾的省略号算在这 256 字节之内。`attempts` 是这条请求试过的候选条数，
 转换失败与连接失败都算一次，`model` 是插件改写之后的模型名。
 
+`attempts` 只数候选条数，一条候选内部的重试不在其中。按
+`channels[].max_retries` 重试时，每次重试另记一行 DEBUG，字段是 `retry`
+（第几次重试，从 1 开始）、`status`（触发重试的上游状态码）与 `wait`
+（这次重试之前等待的时长）；次数用尽时再记一行 DEBUG `渠道内重试次数已用尽`。
+这些行只在 `log.level: debug` 下出现，`max_retries` 为 0 时一行都不写。
+
 `duration` 是 slog 的时长属性：`text` 格式下形如 `12.3ms`，`json` 下是纳秒整数。
 
 宿主要在每次请求结束时记自己的指标，用 `server.WithRequestDone` 拿原始量，

@@ -130,6 +130,9 @@ models:
 	if attempt.Channel != "upstream" || attempt.Status != http.StatusOK || attempt.Duration <= 0 {
 		t.Fatalf("候选尝试记录不符: %+v", attempt)
 	}
+	if attempt.Retries != 0 {
+		t.Fatalf("没有配重试时 Retries 应当是 0: %+v", attempt)
+	}
 	if outcome.Usage == nil {
 		t.Fatalf("跨方言转发解析得出用量，不该是 nil: %+v", outcome)
 	}
@@ -296,6 +299,9 @@ models:
 	for index, attempt := range outcome.Attempts {
 		if attempt.Duration <= 0 {
 			t.Fatalf("第 %d 次尝试的耗时应为正: %v", index+1, attempt.Duration)
+		}
+		if attempt.Retries != 0 {
+			t.Fatalf("max_retries: 0 时第 %d 次尝试的 Retries 应当是 0: %+v", index+1, attempt)
 		}
 	}
 }

@@ -41,12 +41,18 @@ func (b *logBuffer) String() string {
 // 这样断言只看得到访问日志与 WARN，不会混进别的级别。
 func newLoggingServer(t *testing.T, yaml string) (*httptest.Server, *logBuffer) {
 	t.Helper()
+	return newLoggingServerAt(t, yaml, slog.LevelDebug)
+}
+
+// newLoggingServerAt 与 newLoggingServer 相同，日志级别可指定。
+func newLoggingServerAt(t *testing.T, yaml string, level slog.Level) (*httptest.Server, *logBuffer) {
+	t.Helper()
 	cfg, err := config.Parse(strings.NewReader(yaml))
 	if err != nil {
 		t.Fatalf("解析配置失败: %v", err)
 	}
 	logs := &logBuffer{}
-	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: level}))
 	handler, err := server.FromConfig(cfg, logger)
 	if err != nil {
 		t.Fatalf("装配服务失败: %v", err)
