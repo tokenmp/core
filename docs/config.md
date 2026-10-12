@@ -318,7 +318,8 @@ pass_headers:
 同方言的流式透传也记用量：内核在按字节转发的旁路里只看 OpenAI 系两种方言分片的
 `data`，命中 `usage` 才解析。Responses 把同一个数报在 `input_tokens` 与
 `output_tokens` 上，记账时与 Chat 那套字段合成一组数。
-同方言的非流式透传不解析用量，完成行里不会有这些 token 字段。
+同方言的非流式透传也记用量：响应字节原样返回，但先用子串 `usage`（Gemini 为
+`usageMetadata`）预筛，命中才解码取用量。解码失败时不记用量，请求照常成功。
 
 `method`、`path`、`user_agent` 与 `model` 的值来自请求，超过 256 字节时截断，
 末尾的省略号算在这 256 字节之内。`attempts` 是这条请求试过的候选条数，
