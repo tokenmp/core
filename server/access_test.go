@@ -215,8 +215,8 @@ models:
 	if _, ok := line["duration"]; !ok {
 		t.Fatalf("缺少 duration 字段: %v", line)
 	}
-	if _, ok := line["prompt_tokens"]; ok {
-		t.Fatalf("同方言透传不解析用量，不应出现 token 字段: %v", line)
+	if got := numberField(t, line, "prompt_tokens"); got != 3 {
+		t.Fatalf("同方言非流式透传应记录用量: %v", line)
 	}
 }
 

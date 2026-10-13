@@ -8,6 +8,7 @@
 package relay
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -262,7 +263,11 @@ type Response struct {
 // PrepareResponse 把上游非流式响应转换回客户端方言。
 func (e *Engine) PrepareResponse(ctx context.Context, resp Response) (*PreparedResponse, error) {
 	if resp.From == resp.To {
-		return &PreparedResponse{Passthrough: true, Body: resp.Body}, nil
+		return &PreparedResponse{
+			Passthrough: true,
+			Body:        resp.Body,
+			Usage:       passthroughUsage(ctx, e.responseMeta(resp.OriginModel, resp.UpstreamModel), resp),
+		}, nil
 	}
 	response, err := dialect.DecodeResponse(resp.From, resp.Body)
 	if err != nil {
@@ -283,6 +288,25 @@ func (e *Engine) PrepareResponse(ctx context.Context, resp Response) (*PreparedR
 		report:      reportOfResponse(result),
 		diagnostics: responseDiagnostics(result),
 	}, nil
+}
+
+// passthroughUsage 为同方言直通的响应取出用量，响应字节本身不改。
+// 子串预筛覆盖四种方言的用量键（Gemini 为 usageMetadata），只有可能带用量的
+// 响应才解码。解码或转换失败时返回 nil：直通的字节照常写给客户端，统计失败
+// 不能让请求失败。
+func passthroughUsage(ctx context.Context, meta *convmeta.Values, resp Response) *dto.Usage {
+	if !bytes.Contains(resp.Body, []byte("usage")) {
+		return nil
+	}
+	decoded, err := dialect.DecodeResponse(resp.From, resp.Body)
+	if err != nil {
+		return nil
+	}
+	result, err := relayconvert.ConvertResponse(ctx, meta, relayFormatOf(resp.From), decoded)
+	if err != nil {
+		return nil
+	}
+	return result.Usage
 }
 
 // responseMeta 构造响应阶段的转换上下文。推理状态在响应阶段不参与判断，

@@ -211,6 +211,39 @@ func TestSameDialectIsPassthrough(t *testing.T) {
 	}
 }
 
+func TestSameDialectResponseKeepsBytesAndReportsUsage(t *testing.T) {
+	engine := relay.NewEngine(relay.Options{})
+	cases := []struct {
+		name      string
+		dialect   dialect.Name
+		body      string
+		wantUsage bool
+	}{
+		{"openai with usage", dialect.OpenAIChat, `{"id":"x","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}`, true},
+		{"gemini with usageMetadata", dialect.GeminiGenerate, `{"candidates":[{"content":{"role":"model","parts":[{"text":"hi"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}}`, true},
+		{"openai without usage", dialect.OpenAIChat, `{"id":"x","object":"chat.completion","created":1,"model":"m","choices":[]}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prepared, err := engine.PrepareResponse(context.Background(), relay.Response{
+				From: tc.dialect, To: tc.dialect, Body: []byte(tc.body), OriginModel: "m",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !prepared.Passthrough || string(prepared.Body) != tc.body {
+				t.Fatalf("同方言响应应原样透传: passthrough=%v body=%s", prepared.Passthrough, prepared.Body)
+			}
+			if (prepared.Usage != nil) != tc.wantUsage {
+				t.Fatalf("用量存在性不符: got %v, want %v", prepared.Usage != nil, tc.wantUsage)
+			}
+			if tc.wantUsage && (prepared.Usage.PromptTokens != 10 || prepared.Usage.CompletionTokens != 5) {
+				t.Fatalf("用量不符: %+v", prepared.Usage)
+			}
+		})
+	}
+}
+
 func TestSameDialectRewritesOnlyModelField(t *testing.T) {
 	engine := relay.NewEngine(relay.Options{})
 	// 非规范 JSON：多余空白、未建模字段与 1e5 写法都要原样保留，
