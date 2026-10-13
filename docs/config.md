@@ -333,6 +333,13 @@ pass_headers:
 
 `duration` 是 slog 的时长属性：`text` 格式下形如 `12.3ms`，`json` 下是纳秒整数。
 
+这个值的精度就是平台单调时钟的粒度，不另行记录：Linux 上是纳秒，
+Windows 上只有系统时钟中断的粒度，通常 0.5 到 15 毫秒。
+粗粒度平台上短于一个刻度的等待量出来是 `0`：`0` 只说明这一次没测出来，
+不代表请求瞬时完成、也不代表请求失败。`server.Outcome` 的几个耗时字段取自同
+一个时间源，精度同理；要分辨「整个请求没有写出过响应体」，看同一个
+`server.Outcome` 里的 `BytesWritten` 是不是 0。
+
 宿主要在每次请求结束时记自己的指标，用 `server.WithRequestDone` 拿原始量，
 不必解析这两行。要整个接管记录就用 `Options.Middleware`、`Options.DisableAccessLog`
 与 `Options.OnRequestDone`（回调才是拿到内核数据的入口），详见
