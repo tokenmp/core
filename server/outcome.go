@@ -37,9 +37,10 @@ type Outcome struct {
 	//
 	// 精度与平台时钟相同，不另行记一个刻度值：能测多细就是宿主算 TTFT 与 TPS 的精度上限。
 	// 单调时钟的粒度按平台差几个数量级——Linux 上是纳秒，Windows 上是系统时钟中断的粒度
-	// （`time` 包写的是通常 0.5 到 15 毫秒）。在粗粒度平台上，短于一个刻度的等待会量成 0，
-	// 而这个 0 与「整个请求没有写出过响应体」是同一个值，两处含义分不开；宿主应当先按
-	// 平台判断这个数可不可信。Duration 与 Attempt.Duration 同理。
+	// （`time` 包写的是通常 0.5 到 15 毫秒）。在粗粒度平台上，短于一个刻度的等待会量成 0：
+	// 这个 0 只说明这一次没测出来，不代表请求瞬时完成、也不代表请求失败。要分辨上面那条
+	// 「整个请求没有写出过响应体」，看同一个 server.Outcome 里的 BytesWritten 是不是 0，
+	// 别拿这个 0 当判据。Duration 与 Attempt.Duration 的精度同理。
 	FirstByte time.Duration
 	// BytesWritten 是写回客户端的响应体字节数，不含响应头。
 	BytesWritten int64
@@ -73,7 +74,8 @@ type Attempt struct {
 	// Duration 是这次尝试的耗时，从选定候选算到拿到响应头或失败。含这条候选内部
 	// 的全部退避等待。
 	//
-	// 精度同 FirstByte：粗粒度时钟平台上可能量成 0，而这条候选并没有失败。
+	// 精度同 FirstByte：粗粒度时钟平台上可能量成 0，而这条候选并没有失败。这里没有
+	// 旁证可看：失败与否只有 Status 与 Failure 报出来，它们各自又都可能是 0 或空串。
 	Duration time.Duration
 }
 
