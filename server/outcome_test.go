@@ -567,16 +567,64 @@ models:
 }
 
 // TestOutcomeZeroDurationMeansUnmeasurable 把 0 的解释固定下来：内核的时间源分辨不出这段
-// 等待时，Duration 与 FirstByte 是 0，而这次请求照样有结果——状态码与写出的字节数都在。
+// 等待时，Duration 与 FirstByte 是 0，而这次请求照样成功——状态码与响应体都在。
 //
 // 这条是 #44 那处语义混淆的固定点。粗粒度时钟平台上，0 既可能是「这段等待短于一个刻度」，
 // 也可能是「整个请求没有写出过响应体」，光看两条时长区分不出；要分辨得看同一个
 // server.Outcome 里的 BytesWritten——它由内核的写出路径记录，与时间源无关。
 //
-// 这条对照同时是这条用例自己的把关点：字节数为 0 的实现（把响应体吞掉、或压根没写出去）
-// 会在这里红，而只断言「时长 0 + 状态 200」是拦不住它的：那正是这条用例期待的那组值，
-// 那样的实现与真货同值，用例就成了共犯。
+// 这条用例也是它自己的把关点：字节数为 0 的实现（把响应体吞掉、或压根没写出去）会在这里
+// 红。只断言「耗时 0 + 状态 200」拦不住那种实现：那正是这条用例期待的那组值，两者同值。
+// 因此这里除了字节数，还比对响应体里的标记——只有真上游会给的那个 id。状态码与尝试状态
+// 在冻结时间源下对真值假值同号，标记不会。
 func TestOutcomeZeroDurationMeansUnmeasurable(t *testing.T) {
+	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, openAIChatResponse)
+	})
+	front, outcomes := newOutcomeServer(t, `
+channels:
+  - {name: upstream, dialect: openai, base_url: "`+upstreamServer.URL+`"}
+models:
+  - {match: "client-model", channel: upstream}
+`, withFrozenClock())
+
+	status, _, payload := post(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`)
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d %s", status, payload)
+	}
+
+	outcome := outcomes.wait(t, 1)[0]
+	if outcome.Duration != 0 || outcome.FirstByte != 0 {
+		t.Fatalf("时钟不分时两个时长都应当是 0: duration=%v first=%v",
+			outcome.Duration, outcome.FirstByte)
+	}
+	if outcome.Status != http.StatusOK {
+		t.Fatalf("状态码不符: %d", outcome.Status)
+	}
+	// 时长由时间源算，字节数由内核的写出路径记录，两笔数互不相干。字节数等于客户端收到的
+	// 长度、且不为 0，说明这次确实写出去过响应体，那两个 0 只可能是量不出来。
+	if outcome.BytesWritten != int64(len(payload)) || outcome.BytesWritten == 0 {
+		t.Fatalf("响应体照样写了出去: %d，客户端收到 %d", outcome.BytesWritten, len(payload))
+	}
+	// 响应体里那个 id 只有真上游会给。转发链把响应吞掉时字节数与长度可能都还在，
+	// 标记不在。
+	if !strings.Contains(string(payload), `"id":"chatcmpl-1"`) {
+		t.Fatalf("客户端收到的响应体不是上游那份: %s", payload)
+	}
+	if len(outcome.Attempts) != 1 || outcome.Attempts[0].Status != http.StatusOK || outcome.Attempts[0].Duration != 0 {
+		t.Fatalf("尝试记录应当只有一条、状态 200、耗时 0: %+v", outcome.Attempts)
+	}
+}
+
+// TestOutcomeAttemptsReportConnectFailure 覆盖连不上上游时的尝试记录：错误响应的字节数
+// 与尝试的失败原因各是独立的一笔数，耗时的精度不影响它们。
+//
+// 与上一条分开写：那条走的是成功路径（响应体来自上游），这条走失败路径（响应体由内核
+// 自己生成）。「耗时读成 0」在上一条里说明量不出来，在这条里说明不了试没试过——
+// 失败与否只有 Status 与 Failure 报出来，而那两个值本身又可能是 0 或空串，
+// 所以这里必须把它们看清。
+func TestOutcomeAttemptsReportConnectFailure(t *testing.T) {
 	front, outcomes := newOutcomeServer(t, `
 channels:
   - {name: upstream, dialect: openai, base_url: "https://127.0.0.1:1"}
@@ -595,14 +643,11 @@ models:
 		t.Fatalf("时钟不分时两个时长都应当是 0: duration=%v first=%v",
 			outcome.Duration, outcome.FirstByte)
 	}
-	// 时长由时间源算，字节数由内核的写出路径记录，两笔数互不相干。字节数等于客户端收到的
-	// 长度、且不为 0，说明这次确实写出去过响应体，那两个 0 只可能是量不出来。
 	if outcome.BytesWritten != int64(len(payload)) || outcome.BytesWritten == 0 {
 		t.Fatalf("错误响应也是响应体，照样写了出去: %d，客户端收到 %d",
 			outcome.BytesWritten, len(payload))
 	}
-	// 尝试记录是第三笔数：一次尝试、没拿到上游响应、耗时读成 0。这里必须看清
-	// 「没拿到响应」这一项，光看耗时与状态分不出真失败与「记成一次瞬时成功」。
+	// 光看耗时与状态分不出真失败与「记成一次瞬时成功」，这里必须看清「没拿到响应」这一项。
 	if len(outcome.Attempts) != 1 || outcome.Attempts[0].Status != 0 || outcome.Attempts[0].Duration != 0 {
 		t.Fatalf("尝试记录应当只有一条、没拿到上游响应、耗时 0: %+v", outcome.Attempts)
 	}
