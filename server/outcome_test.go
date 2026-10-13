@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,8 +49,8 @@ func (c *outcomeCollector) wait(t *testing.T, want int) []server.Outcome {
 	}
 }
 
-// newOutcomeServer 装配一个同时收日志与 Outcome 的服务。
-func newOutcomeServer(t *testing.T, yaml string) (*httptest.Server, *outcomeCollector) {
+// newOutcomeServer 装配一个同时收日志与 Outcome 的服务，extra 用来注入 Options。
+func newOutcomeServer(t *testing.T, yaml string, extra ...server.Option) (*httptest.Server, *outcomeCollector) {
 	t.Helper()
 	cfg, err := config.Parse(strings.NewReader(yaml))
 	if err != nil {
@@ -57,7 +58,8 @@ func newOutcomeServer(t *testing.T, yaml string) (*httptest.Server, *outcomeColl
 	}
 	logger := slog.New(slog.NewJSONHandler(&logBuffer{}, nil))
 	collector := &outcomeCollector{}
-	handler, err := server.FromConfigWith(cfg, logger, server.WithRequestDone(collector.add))
+	opts := append([]server.Option{server.WithRequestDone(collector.add)}, extra...)
+	handler, err := server.FromConfigWith(cfg, logger, opts...)
 	if err != nil {
 		t.Fatalf("装配服务失败: %v", err)
 	}
@@ -66,7 +68,41 @@ func newOutcomeServer(t *testing.T, yaml string) (*httptest.Server, *outcomeColl
 	return front, collector
 }
 
+// fixedStep 是固定步长时钟每次读前进的量。
+const fixedStep = 5 * time.Millisecond
+
+// withFixedStepClock 把内核的时间源换成每次读都前进固定步长的时钟。
+//
+// 它是给「两次读数的差算对了没有」这类断言用的：这个时钟一定能分辨出一次进程内往返，
+// 断言不必再看本机的时钟粒度，因此在任何平台上都稳定。真实耗时由此不可测，
+// 要测真实耗时就得用本机的时钟，而那正是做不到严格断言的地方。
+//
+// 用原子自增而不是普通计数：内核的读时刻点分布在请求自己的 goroutine 上，
+// 将来并行跑用例时会撞上 -race。
+func withFixedStepClock() server.Option {
+	var ticks atomic.Int64
+	base := time.Unix(0, 0)
+	return func(options *server.Options) {
+		options.Now = func() time.Time { return base.Add(time.Duration(ticks.Add(1)) * fixedStep) }
+	}
+}
+
+// withFrozenClock 把内核的时间源固定成同一个时刻：它报出的每个时长都恰好是 0。
+//
+// 这是粗粒度时钟的极端形态，用它来钉住 0 的解释：耗时读成 0 只说明这段等待量不出来，
+// 不说明请求失败或没写响应体。本机时钟分辨不出一次进程内往返时，得到的正是同一个值，
+// 因此这条断言在任何平台上都成立、也不依赖本机时钟的粒度。
+func withFrozenClock() server.Option {
+	frozen := time.Unix(1700000000, 0)
+	return func(options *server.Options) {
+		options.Now = func() time.Time { return frozen }
+	}
+}
+
 // TestOutcomeForBufferedRequest 逐项核对非流式请求交出的原始量。
+//
+// 用固定步长时钟：这条用例要断言首字节时刻确实被取到了（差落在步长上），
+// 而这在本机时钟上做不到——一次进程内往返在粗粒度平台上会量成 0。
 func TestOutcomeForBufferedRequest(t *testing.T) {
 	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
 		writeJSON(writer, http.StatusOK, openAIChatResponse)
@@ -76,7 +112,7 @@ channels:
   - {name: upstream, dialect: openai, base_url: "`+upstreamServer.URL+`"}
 models:
   - {match: "client-model", channel: upstream}
-`)
+`, withFixedStepClock())
 
 	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
 		front.URL+"/v1/messages",
@@ -115,9 +151,14 @@ models:
 	if outcome.Streaming {
 		t.Fatalf("这个请求不是流式: %+v", outcome)
 	}
-	// 首字节时间要落在总时长之内，且非零。
-	if outcome.FirstByte <= 0 || outcome.FirstByte > outcome.Duration {
+	// 首字节时间要落在总时长之内，且两个时长都落在固定步长上：非流式响应一次写完，
+	// 两次读之间只隔几个时刻点。这是内核确实取到了这两个时刻的直接证据。
+	if outcome.FirstByte < 0 || outcome.FirstByte > outcome.Duration {
 		t.Fatalf("首字节时间不合理: first=%v duration=%v", outcome.FirstByte, outcome.Duration)
+	}
+	if outcome.FirstByte%fixedStep != 0 || outcome.Duration%fixedStep != 0 {
+		t.Fatalf("固定步长时钟下两个时长都应当是步长的整数倍: first=%v duration=%v",
+			outcome.FirstByte, outcome.Duration)
 	}
 	// 写出字节数就是客户端收到的响应体长度。
 	if outcome.BytesWritten != int64(len(payload)) {
@@ -127,7 +168,7 @@ models:
 		t.Fatalf("应当只有一次候选尝试: %+v", outcome.Attempts)
 	}
 	attempt := outcome.Attempts[0]
-	if attempt.Channel != "upstream" || attempt.Status != http.StatusOK || attempt.Duration <= 0 {
+	if attempt.Channel != "upstream" || attempt.Status != http.StatusOK || attempt.Duration < 0 {
 		t.Fatalf("候选尝试记录不符: %+v", attempt)
 	}
 	if attempt.Retries != 0 {
@@ -314,7 +355,11 @@ models:
 	if !outcome.Streaming {
 		t.Fatalf("这个请求是流式: %+v", outcome)
 	}
-	if outcome.FirstByte <= 0 || outcome.FirstByte >= outcome.Duration {
+	// 首字节时间要早于总时长。这里的差是真实等待：上游发完第一个分片后停住不放，
+	// 总时长因此比首字节时间长出一个可观的量，任何时钟粒度都分辨得出。非零这条
+	// 不在这里断言：一次进程内往返在粗粒度平台上会量成 0，那条语义由固定步长
+	// 时钟的两条用例钉住。
+	if outcome.FirstByte < 0 || outcome.FirstByte >= outcome.Duration {
 		t.Fatalf("首字节时间应当明显早于总时长: first=%v duration=%v",
 			outcome.FirstByte, outcome.Duration)
 	}
@@ -364,6 +409,10 @@ models:
 
 // TestOutcomeCountsEveryAttempt 覆盖重试：降级换过渠道之后，每次尝试的耗时与状态
 // 都在 Outcome 里，不只一个条数。
+//
+// 用固定步长时钟：两次尝试各是一段真实的进程内往返，真实时钟在粗粒度平台上会把
+// 它们量成 0，「耗时应为正」这条断言在那里站不住。固定步长下这个值必然为正，
+// 断言与平台无关。
 func TestOutcomeCountsEveryAttempt(t *testing.T) {
 	_, brokenServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
 		writeJSON(writer, http.StatusServiceUnavailable, `{"error":"down"}`)
@@ -378,7 +427,7 @@ channels:
 models:
   - {match: "client-model", channel: broken}
   - {match: "client-model", channel: good}
-`)
+`, withFixedStepClock())
 
 	status, _, _ := post(t, front.URL+"/v1/chat/completions",
 		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`)
@@ -399,8 +448,10 @@ models:
 		t.Fatalf("第二次尝试不符: %+v", outcome.Attempts[1])
 	}
 	for index, attempt := range outcome.Attempts {
-		if attempt.Duration <= 0 {
-			t.Fatalf("第 %d 次尝试的耗时应为正: %v", index+1, attempt.Duration)
+		// 固定步长时钟下这个值必然是正的，且落在步长上；具体是几步由内核读时刻的
+		// 次数决定，写死步数会让这条用例在无关改动下变红。
+		if attempt.Duration <= 0 || attempt.Duration%fixedStep != 0 {
+			t.Fatalf("第 %d 次尝试的耗时应为正且落在时钟步长上: %v", index+1, attempt.Duration)
 		}
 		if attempt.Retries != 0 {
 			t.Fatalf("max_retries: 0 时第 %d 次尝试的 Retries 应当是 0: %+v", index+1, attempt)
@@ -512,5 +563,101 @@ models:
 			t.Fatalf("request_id 重复: %s", outcome.RequestID)
 		}
 		seen[outcome.RequestID] = true
+	}
+}
+
+// TestOutcomeZeroDurationMeansUnmeasurable 钉住 0 的解释：内核的时间源分辨不出这段
+// 等待时，Duration 与 FirstByte 是 0，而这次请求**成功了**——状态码、字节数、用量都在。
+//
+// 这条是 #44 那处语义混淆的固定点。粗粒度时钟平台上「等待短于一个刻度」与「整个请求
+// 没有写出过响应体」会给出同一个 0，宿主只看值分不开；这条用例把前一种情形连同它旁边
+// 那些非零的字段一起记下来：0 说的是量不出来，不是失败了。
+func TestOutcomeZeroDurationMeansUnmeasurable(t *testing.T) {
+	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, openAIChatResponse)
+	})
+	front, outcomes := newOutcomeServer(t, `
+channels:
+  - {name: upstream, dialect: openai, base_url: "`+upstreamServer.URL+`"}
+models:
+  - {match: "client-model", channel: upstream}
+`, withFrozenClock())
+
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		front.URL+"/v1/messages",
+		strings.NewReader(`{"model":"client-model","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}`))
+	if err != nil {
+		t.Fatalf("构造请求失败: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("请求失败: %v", err)
+	}
+	payload, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if err != nil {
+		t.Fatalf("读取响应失败: %v", err)
+	}
+
+	outcome := outcomes.wait(t, 1)[0]
+	if outcome.Duration != 0 || outcome.FirstByte != 0 {
+		t.Fatalf("时钟不分时两个时长都应当是 0: duration=%v first=%v",
+			outcome.Duration, outcome.FirstByte)
+	}
+	// 时长是 0，而这次请求照样成功。
+	if outcome.Status != http.StatusOK {
+		t.Fatalf("时长读成 0 不代表请求失败: %d", outcome.Status)
+	}
+	if outcome.BytesWritten != int64(len(payload)) || outcome.BytesWritten == 0 {
+		t.Fatalf("响应体照样写了出去: %d，客户端收到 %d", outcome.BytesWritten, len(payload))
+	}
+	if outcome.Channel != "upstream" || outcome.Usage == nil {
+		t.Fatalf("渠道与用量应当照常有: %+v", outcome)
+	}
+	if len(outcome.Attempts) != 1 || outcome.Attempts[0].Duration != 0 || outcome.Attempts[0].Status != http.StatusOK {
+		t.Fatalf("尝试记录应当只有一条、耗时 0、状态 200: %+v", outcome.Attempts)
+	}
+}
+
+// TestOutcomeDurationsFollowInjectedClock 覆盖耗时字段的取值来源：内核报出的每个时长
+// 都落在时间源的步长上。
+//
+// 这是「Duration 与 FirstByte 是按内核的时间源算的」那条口径的回归位：内核改用别的时间源
+// （例如直接读 time.Now 绕开 Options.Now）时，这些值会落到步长之外，这条用例就会红。
+// 与前一条一样，它不依赖本机时钟的分辨率。
+func TestOutcomeDurationsFollowInjectedClock(t *testing.T) {
+	_, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, openAIChatResponse)
+	})
+	front, outcomes := newOutcomeServer(t, `
+channels:
+  - {name: upstream, dialect: openai, base_url: "`+upstreamServer.URL+`"}
+models:
+  - {match: "client-model", channel: upstream}
+`, withFixedStepClock())
+
+	status, _, body := post(t, front.URL+"/v1/chat/completions",
+		`{"model":"client-model","messages":[{"role":"user","content":"你好"}]}`)
+	if status != http.StatusOK {
+		t.Fatalf("状态码不符: %d %s", status, body)
+	}
+
+	outcome := outcomes.wait(t, 1)[0]
+	if outcome.Duration%fixedStep != 0 || outcome.FirstByte%fixedStep != 0 {
+		t.Fatalf("两个时长都应当落在时钟步长上: first=%v duration=%v",
+			outcome.FirstByte, outcome.Duration)
+	}
+	if outcome.FirstByte < 0 || outcome.FirstByte > outcome.Duration {
+		t.Fatalf("首字节时间不合理: first=%v duration=%v", outcome.FirstByte, outcome.Duration)
+	}
+	if len(outcome.Attempts) != 1 {
+		t.Fatalf("应当只有一次候选尝试: %+v", outcome.Attempts)
+	}
+	// 尝试耗时是「选定候选」到「拿到响应头」的两次读，中间隔着一次进程内往返。
+	// 它的具体值由内核读时刻的次数决定，只断言落在步长上，写死步数会让这条用例
+	// 在无关改动下变红。
+	if attempt := outcome.Attempts[0]; attempt.Duration < 0 || attempt.Duration%fixedStep != 0 {
+		t.Fatalf("尝试耗时应当落在时钟步长上: %v", attempt.Duration)
 	}
 }

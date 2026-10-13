@@ -34,6 +34,12 @@ type Outcome struct {
 	// 只算响应体，不算响应头：流式路径拿到上游响应头就写响应头，而第一个分片可能过很久
 	// 才到，按响应头记会让 TTFT 系统性偏小。非流式响应是一次写完的，这个值因此约等于
 	// Duration，看不出 TTFT——该不该算由宿主按 Streaming 自己判断。
+	//
+	// 精度与平台时钟相同，不另行记一个刻度值：能测多细就是宿主算 TTFT 与 TPS 的精度上限。
+	// 单调时钟的粒度按平台差几个数量级——Linux 上是纳秒，Windows 上是系统时钟中断的粒度
+	// （`time` 包写的是通常 0.5 到 15 毫秒）。在粗粒度平台上，短于一个刻度的等待会量成 0，
+	// 而这个 0 与「整个请求没有写出过响应体」是同一个值，两处含义分不开；宿主应当先按
+	// 平台判断这个数可不可信。Duration 与 Attempt.Duration 同理。
 	FirstByte time.Duration
 	// BytesWritten 是写回客户端的响应体字节数，不含响应头。
 	BytesWritten int64
@@ -66,6 +72,8 @@ type Attempt struct {
 	Retries int
 	// Duration 是这次尝试的耗时，从选定候选算到拿到响应头或失败。含这条候选内部
 	// 的全部退避等待。
+	//
+	// 精度同 FirstByte：粗粒度时钟平台上可能量成 0，而这条候选并没有失败。
 	Duration time.Duration
 }
 
