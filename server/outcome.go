@@ -15,6 +15,9 @@ import (
 // 这是唯一的可选项。
 type Outcome struct {
 	// RequestID 是这次请求的 id，与访问日志里的 request_id 相同。
+	//
+	// 它在不同进程、不同实例之间都不重复，进程重启也不会与上次那些撞上，因此可以
+	// 直接当幂等键或对账键用。完整的取值形状见 docs/config.md 的「访问日志」一节。
 	RequestID string
 	Method    string
 	Path      string
