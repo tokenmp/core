@@ -89,7 +89,7 @@ func withFixedStepClock() server.Option {
 
 // withFrozenClock 把内核的时间源固定成同一个时刻：它报出的每个时长都恰好是 0。
 //
-// 这是粗粒度时钟的极端形态，用它来钉住 0 的解释：耗时读成 0 只说明这段等待量不出来，
+// 这是粗粒度时钟的极端形态，用它把 0 的解释固定下来：耗时读成 0 只说明这段等待量不出来，
 // 不说明请求失败或没写响应体。本机时钟分辨不出一次进程内往返时，得到的正是同一个值，
 // 因此这条断言在任何平台上都成立、也不依赖本机时钟的粒度。
 func withFrozenClock() server.Option {
@@ -185,7 +185,7 @@ models:
 // TestOutcomeUsageForStreamingPassthrough 覆盖同方言流式透传：上游在流末给出用量时，
 // 客户端收到的字节不变，宿主的 Outcome 与账目行也拿到 token 数。
 //
-// 用量本来就在上游分片里，只是以前宿主没读。这里同时钉住两件事：旁路扫描不改变报文，
+// 用量本来就在上游分片里，只是以前宿主没读。这里同时确认两件事：旁路扫描不改变报文，
 // 以及记账走的是与跨方言相同的 recordUsage。
 func TestOutcomeUsageForStreamingPassthrough(t *testing.T) {
 	chunks := []string{
@@ -273,7 +273,7 @@ models:
 // 透传：用量挂在 response.completed 分片的 response.usage 下。
 //
 // Responses 的原始用量用 input_tokens/output_tokens，而 recordUsage 读的是
-// prompt_tokens/completion_tokens，这里只钉住取到的是同一份用量（total_tokens），
+// prompt_tokens/completion_tokens，这里只保证取到的是同一份用量（total_tokens），
 // 字段形状的差异不在本次改动范围内。
 func TestOutcomeUsageForResponsesStreamingPassthrough(t *testing.T) {
 	event := `{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":11,"output_tokens":22,"total_tokens":33}}}`
@@ -358,7 +358,7 @@ models:
 	// 首字节时间要早于总时长。这里的差是真实等待：上游发完第一个分片后停住不放，
 	// 总时长因此比首字节时间长出一个可观的量，任何时钟粒度都分辨得出。非零这条
 	// 不在这里断言：一次进程内往返在粗粒度平台上会量成 0，那条语义由固定步长
-	// 时钟的两条用例钉住。
+	// 时钟的两条用例管。
 	if outcome.FirstByte < 0 || outcome.FirstByte >= outcome.Duration {
 		t.Fatalf("首字节时间应当明显早于总时长: first=%v duration=%v",
 			outcome.FirstByte, outcome.Duration)

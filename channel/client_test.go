@@ -173,7 +173,7 @@ func headerName(item authCase) string {
 	}
 }
 
-// TestClientRequestHeaderOverridesSpecHeaders 钉住两条来源的先后：Spec.Headers 是渠道级的
+// TestClientRequestHeaderOverridesSpecHeaders 定下两条来源的先后：Spec.Headers 是渠道级的
 // 默认值，Request.Header 是请求级的值，同名时后者覆盖前者，线上只出现一条。
 func TestClientRequestHeaderOverridesSpecHeaders(t *testing.T) {
 	var got http.Header

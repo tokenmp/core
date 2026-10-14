@@ -146,7 +146,7 @@ func TestTableMissesUnrelatedChain(t *testing.T) {
 
 // TestTableExpires 确认超过寿命的记忆不再命中。
 //
-// 上游的缓存有寿命，会话冷掉之后继续把它钉在同一个渠道只会白搭上负载集中。
+// 上游的缓存有寿命，会话冷掉之后继续粘在同一个渠道只会白搭上负载集中。
 func TestTableExpires(t *testing.T) {
 	now := newClock()
 	table := NewTable(16, 5*time.Minute, now.Now)
