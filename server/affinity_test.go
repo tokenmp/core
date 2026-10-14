@@ -70,7 +70,7 @@ var longSystemPrompt = strings.Repeat("这是一段用来把前缀撑到门槛�
 
 // chainBody 造一段连续多轮的会话，从第一轮起就带一段很长的系统提示。
 //
-// 系统提示必须足够长，否则测到的是「短前缀不钉」那条路径，而不是前缀链。
+// 系统提示必须足够长，否则测到的是「短前缀不粘」那条路径，而不是前缀链。
 func chainBody(turns int) string {
 	messages := []string{`{"role":"system","content":"` + longSystemPrompt + `"}`}
 	for turn := 1; turn <= turns; turn++ {
@@ -360,7 +360,7 @@ func TestAffinityChainSticksWithoutSession(t *testing.T) {
 	}
 }
 
-// TestAffinityChainSkipsShortPrefix 确认前缀短于门槛时不钉。
+// TestAffinityChainSkipsShortPrefix 确认前缀短于门槛时不粘。
 //
 // 这是差分测试：先在一个不设门槛的服务上找出一份内容会被前缀链分到 second 的会话，
 // 再拿同一份内容去门槛很高的服务上比对。只断言「都走 first」是不够的，因为前缀链

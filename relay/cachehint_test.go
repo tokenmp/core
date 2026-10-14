@@ -10,7 +10,7 @@ import (
 )
 
 // 上游的缓存提示有三种：OpenAI 的 prompt_cache_key、Claude 的 cache_control、
-// Gemini 的 cachedContent。这里把「跨方言转换后还剩什么」实测一遍并钉住。
+// Gemini 的 cachedContent。这里把「跨方言转换后还剩什么」实测一遍，把结果固定下来。
 //
 // 这张表是 RelayKit 的行为，不是本模块的契约。RelayKit 升级后表变了要当回事：
 // 要么是预期内的改进，要么是它的回归。改动转换行为后这张表必须仍然全绿。

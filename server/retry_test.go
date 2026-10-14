@@ -292,7 +292,7 @@ func TestGlobalFailoverStatusesOverride(t *testing.T) {
 	}
 }
 
-// TestBuiltInRetryStatusesMatchConfigDefaults 把两处默认集合钉在一起。
+// TestBuiltInRetryStatusesMatchConfigDefaults 把两处默认集合对齐。
 //
 // 分层红线不允许 config 导入 channel，两组默认值只能各写一份：config 侧是
 // DefaultInChannelStatuses 与 DefaultFailoverStatuses 两个字符串，走 YAML 的部署

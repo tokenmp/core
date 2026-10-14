@@ -120,7 +120,7 @@ func TestUpstreamHeaderReachesUpstream(t *testing.T) {
 	}
 }
 
-// priorityYAML 是带渠道级请求头的配置，用来钉住同名的优先级。
+// priorityYAML 是带渠道级请求头的配置，用来验同名的优先级。
 func priorityYAML(upstreamURL string) string {
 	return `
 channels:
@@ -135,7 +135,7 @@ models:
 `
 }
 
-// TestUpstreamHeaderOverridesChannelConfig 钉住同名头的优先级：宿主按请求设的值覆盖
+// TestUpstreamHeaderOverridesChannelConfig 定下同名头的优先级：宿主按请求设的值覆盖
 // 渠道配置的值，且只发一条；宿主没碰的渠道头照旧上去。
 func TestUpstreamHeaderOverridesChannelConfig(t *testing.T) {
 	record, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
@@ -159,7 +159,7 @@ func TestUpstreamHeaderOverridesChannelConfig(t *testing.T) {
 	}
 }
 
-// TestUpstreamHeaderSameNameLastWins 钉住同一个名字设两次时的语义：后一次生效，
+// TestUpstreamHeaderSameNameLastWins 定下同一个名字设两次时的语义：后一次生效，
 // 与 http.Header.Set 一致。
 func TestUpstreamHeaderSameNameLastWins(t *testing.T) {
 	record, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
@@ -211,7 +211,7 @@ func TestUpstreamHeaderInvalidDropped(t *testing.T) {
 	}
 }
 
-// TestUpstreamHeaderCannotDisplaceChannelCredential 钉住例外：渠道的鉴权头由 Auth 最后
+// TestUpstreamHeaderCannotDisplaceChannelCredential 覆盖例外：渠道的鉴权头由 Auth 最后
 // 写入，宿主按请求设的同名头不生效，凭据始终来自渠道。
 func TestUpstreamHeaderCannotDisplaceChannelCredential(t *testing.T) {
 	t.Setenv("TOKENMP_TEST_KEY", "channel-secret")
@@ -277,7 +277,7 @@ func TestPassHeadersReachUpstream(t *testing.T) {
 	}
 }
 
-// TestPassHeadersForbiddenNotForwarded 钉住不可放行的头即使客户端带着也不上去。
+// TestPassHeadersForbiddenNotForwarded 确认不可放行的头即使客户端带着也不上去。
 // Content-Type 单独看一下：内核按渠道给请求体转换后的形状补值，不是没有这个头。
 func TestPassHeadersForbiddenNotForwarded(t *testing.T) {
 	record, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
@@ -349,7 +349,7 @@ models:
 	}
 }
 
-// TestPassHeaderHostWins 钉住优先级：名字同时在放行名单与宿主头里时，宿主按请求设的赢。
+// TestPassHeaderHostWins 定下一层优先级：名字同时在放行名单与宿主头里时，宿主按请求设的赢。
 func TestPassHeaderHostWins(t *testing.T) {
 	record, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
 		writeJSON(writer, http.StatusOK, openAIChatResponse)
@@ -370,7 +370,7 @@ func TestPassHeaderHostWins(t *testing.T) {
 	}
 }
 
-// TestPassHeaderChannelConfigWins 钉住另一层优先级：渠道 headers 比客户端转发的具体。
+// TestPassHeaderChannelConfigWins 定下另一层优先级：渠道 headers 比客户端转发的具体。
 func TestPassHeaderChannelConfigWins(t *testing.T) {
 	record, upstreamServer := newUpstream(t, func(writer http.ResponseWriter, request *http.Request) {
 		writeJSON(writer, http.StatusOK, openAIChatResponse)
@@ -421,7 +421,7 @@ func TestPassHeaderMultipleValues(t *testing.T) {
 	}
 }
 
-// TestPassHeaderInvalidNameRejectedAtAssembly 钉住头名合法性的分层：config.Validate
+// TestPassHeaderInvalidNameRejectedAtAssembly 覆盖头名合法性的分层：config.Validate
 // 只挡明显写错的，RFC 7230 token 的完整判断在装配时报错，服务启动失败。x(bad) 里的
 // 括号不属于 token 字符集，但 config 不拦它。
 func TestPassHeaderInvalidNameRejectedAtAssembly(t *testing.T) {
@@ -435,7 +435,7 @@ func TestPassHeaderInvalidNameRejectedAtAssembly(t *testing.T) {
 	}
 }
 
-// TestPassHeaderForbiddenRejectedAtAssembly 钉住禁止名单在装配期也拦得住：绕过
+// TestPassHeaderForbiddenRejectedAtAssembly 确认禁止名单在装配期也拦得住：绕过
 // config.Validate 的程序化配置同样不能把 authorization 放进放行名单。
 func TestPassHeaderForbiddenRejectedAtAssembly(t *testing.T) {
 	cfg := &config.Config{

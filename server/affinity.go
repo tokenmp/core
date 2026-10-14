@@ -61,7 +61,7 @@ func (s *Server) planAffinity(
 		return affinityPlan{routes: routes}
 	}
 	if minimum := s.minPrefixBytes; minimum > 0 && affinity.PrefixBytes(entries) < minimum {
-		// 前缀短到进不了上游缓存，钉住只剩负载集中的坏处。
+		// 前缀短到进不了上游缓存，仍按亲和分配只剩负载集中的坏处。
 		return affinityPlan{routes: routes}
 	}
 	chain := affinity.Chain(entries)
