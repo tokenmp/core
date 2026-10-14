@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"strconv"
 	"time"
 	"unicode/utf8"
 
@@ -372,14 +371,6 @@ func (r *accessRecord) outcome(duration time.Duration) Outcome {
 		}
 	}
 	return outcome
-}
-
-// newRequestID 生成进程内唯一的请求 id。
-//
-// 用自增计数器而不是随机数：唯一性由计数器本身保证，不依赖熵源，也就不存在
-// 「生成失败」这条路径。id 只在日志里出现，不参与任何路由或鉴权判断。
-func (s *Server) newRequestID() string {
-	return strconv.FormatUint(s.requestCounter.Add(1), 10)
 }
 
 // maxLogValueBytes 是访问日志里来自请求的字符串字段写出的字节上限。

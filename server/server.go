@@ -113,8 +113,8 @@ type Server struct {
 	now          func() time.Time
 	maxBodyBytes int64
 	handler      http.Handler
-	// requestCounter 是访问日志里请求 id 的来源，进程内自增。
-	requestCounter atomic.Uint64
+	// requestIDCounter 是请求 id 里那一段进程内自增的计数，见 newRequestID。
+	requestIDCounter atomic.Uint64
 	// affinityTable 记住「请求前缀 → 渠道」，供没有会话标识的客户端兜底。
 	affinityTable *affinity.Table
 	// passHeaders 是渠道名到客户端头白名单的查找表，键与名单里的名字都已归一。
