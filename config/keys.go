@@ -83,7 +83,7 @@ var keyDefaults = map[string]string{
 //
 // 路径与类型由 Config 的字段与 yaml tag 现算，字段改名或加减字段时表跟着变，
 // 不存在第二份手抄的字段清单。表里没有「是否可 set」这一列：那是 CLI `config set`
-// 的策略，不是配置本身的事实，钉进 core 的公开面等于把一条命令行的策略写进库的
+// 的策略，不是配置本身的事实，写进 core 的公开面等于把一条命令行的策略写进库的
 // 兼容承诺；CLI 自己维护可写白名单更合适。
 func Keys() []Key {
 	keys := make([]Key, 0, len(keyDefaults))
