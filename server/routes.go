@@ -29,6 +29,9 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc(dialect.OpenAIChat.LocalPath(), s.exact(dialect.OpenAIChat))
 	mux.HandleFunc(dialect.OpenAIResponses.LocalPath(), s.exact(dialect.OpenAIResponses))
 	mux.HandleFunc(dialect.ClaudeMessages.LocalPath(), s.exact(dialect.ClaudeMessages))
+	// 计数端点单列一条路由而不是并进上面那条：它要额外把上游路径补成
+	// /v1/messages/count_tokens，走 exact 那条通用路径会打到消息端点上。
+	mux.HandleFunc(dialect.ClaudeCountTokensPath, s.handleCountTokens)
 	mux.HandleFunc(geminiPrefix, s.handleGemini)
 	return s.withAccessLog(mux)
 }
@@ -39,7 +42,7 @@ func (s *Server) exact(client dialect.Name) http.HandlerFunc {
 		if !s.requirePost(writer, request) {
 			return
 		}
-		s.forward(writer, request, client, "", false)
+		s.forward(writer, request, client, "", false, endpoint{})
 	}
 }
 
@@ -68,7 +71,7 @@ func (s *Server) handleGemini(writer http.ResponseWriter, request *http.Request)
 			fmt.Sprintf("未知动作 %s，可用动作为 generateContent 与 streamGenerateContent", action))
 		return
 	}
-	s.forward(writer, request, dialect.GeminiGenerate, model, stream)
+	s.forward(writer, request, dialect.GeminiGenerate, model, stream, endpoint{})
 }
 
 // handleHealth 是存活探测端点。

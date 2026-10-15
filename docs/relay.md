@@ -186,3 +186,8 @@ RelayKit 的 DTO 与 `dto.Usage` 因此是本模块公开契约的一部分，�
 `dialect.Name.UpstreamPath` 按方言与模型名拼出上游路径，由
 [channel](../channel) 使用。四方言的路径形状写在
 [dialect/dialect.go](../dialect/dialect.go) 里，只有 Gemini 需要模型名。
+
+同一个方言上还有子端点时，那段后缀由 `channel.Request.PathSuffix` 按请求带上，
+追加在解析出的路径之后。它不参与 `UpstreamPath`：那个函数按方言与模型名回答
+「这个方言的主端点在哪」，而子端点是入口的性质，不是方言的性质。Claude
+Messages 的计数端点就是这么接上去的，见 [server](../server) 的 `countTokensEndpoint`。

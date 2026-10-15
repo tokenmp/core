@@ -159,6 +159,13 @@ type Request struct {
 	Model string
 	// Stream 决定取流式端点还是非流式端点，只有 Gemini 用得到。
 	Stream bool
+	// PathSuffix 追加到解析出的上游路径之后，用于同一个方言下的子端点。
+	//
+	// 它是按请求给的，与 Spec.Path 那条按渠道给的覆盖不是一回事：同一个方言上
+	// 有多条端点时（例如 Claude Messages 与它的计数端点），渠道级的那个值表达
+	// 不了。追加发生在 Spec.Path 与方言默认路径之后，因此渠道把消息路径改写
+	// 成别的形状时，子端点跟着它走，而不是回到方言默认值上。
+	PathSuffix string
 	// Body 是请求体，会被完整缓存在内存里，因此可以重试。
 	Body []byte
 	// Header 是请求级请求头，同名时覆盖 Spec.Headers 里的值。
@@ -352,6 +359,9 @@ func (c *Client) endpoint(req Request) (string, error) {
 			return "", err
 		}
 		path = resolved
+	}
+	if req.PathSuffix != "" {
+		path = strings.TrimSuffix(path, "/") + req.PathSuffix
 	}
 	if path != "" && !strings.HasPrefix(path, "/") {
 		path = "/" + path

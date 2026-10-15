@@ -31,6 +31,16 @@ TokenMP 的转发内核，Go 库，模块 `github.com/tokenmp/core`。
 Anthropic Claude Messages 与 Google Gemini generateContent，
 任意两种之间都能转换。
 
+Claude Messages 另有一个计数端点，路径是 `POST /v1/messages/count_tokens`，
+请求体与 Messages 同形，只少了 `max_tokens`。它在服务端按模型算，
+不在本地估算，因此转发到上游取结果：只有 `claude` 方言的候选渠道服务得了，
+模型的候选里一条这样的渠道都没有时回 `501`，错误类型是 `not_supported`。
+客户端据此自己降级，这是它本来就会做的事。这个端点不参与渠道亲和：
+计数不写上游缓存，粘住它没有意义；上游给出的错误照原样透传。
+
+`Outcome.Path` 是计数端点自己的路径，不是 Messages 入口那条。记录侧按这个
+路径区分入口，记成 Messages 入口会留下一行没有 token 数的调用记录，且不报错。
+
 ## 起一个服务
 
 ```go

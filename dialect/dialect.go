@@ -57,6 +57,15 @@ const (
 	GeminiGenerate Name = "gemini"
 )
 
+// ClaudeCountTokensPath 是 Claude Messages 计数端点的路径，本地与上游同形。
+//
+// 它不是第五种方言：请求体与 Messages 同形，只是路径在 Messages 之后多一段，
+// 响应也只回一个输入 token 数。因此它不进 LocalPath 与 UpstreamPath 的返回值，
+// 而是单列成常量，由 server 在计数那条路径上取用。
+//
+//nolint:gosec // 这是一条路径，含 token 一词的是路径段而不是凭据。
+const ClaudeCountTokensPath = "/v1/messages/count_tokens"
+
 // Names 按固定顺序返回四种方言，供配置校验、文档与测试遍历。
 func Names() []Name {
 	return []Name{OpenAIChat, OpenAIResponses, ClaudeMessages, GeminiGenerate}
