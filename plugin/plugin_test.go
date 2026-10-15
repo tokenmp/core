@@ -388,7 +388,7 @@ func TestLoadFixtureFromFile(t *testing.T) {
 }
 
 // mergePayload 是测试用的合并函数：把改写里的 model 与 body 合并回负载，
-// 语义与 server 层的 mergeRequest 一致。
+// 语义与 server 层的 mergeRequest 一致，headers 也按同样口径逐项合并。
 func mergePayload(payload, rewrite []byte) ([]byte, error) {
 	var current map[string]any
 	if err := json.Unmarshal(payload, &current); err != nil {
@@ -406,6 +406,17 @@ func mergePayload(payload, rewrite []byte) ([]byte, error) {
 		}
 		current[key] = value
 		changed = true
+	}
+	if added, ok := change["headers"].(map[string]any); ok {
+		headers, _ := current["headers"].(map[string]any)
+		if headers == nil {
+			headers = make(map[string]any, len(added))
+		}
+		for name, value := range added {
+			headers[name] = value
+			changed = true
+		}
+		current["headers"] = headers
 	}
 	if !changed {
 		return nil, nil

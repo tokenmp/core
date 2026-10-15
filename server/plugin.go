@@ -1,6 +1,9 @@
 package server
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // requestPayload 是 onRequest 的输入。
 type requestPayload struct {
@@ -12,6 +15,11 @@ type requestPayload struct {
 	Stream bool `json:"stream"`
 	// Body 是请求体。
 	Body json.RawMessage `json:"body"`
+	// Headers 是插件到目前为止加上的上游请求头。
+	//
+	// 它只装插件写进来的那些，客户端请求头与渠道 headers 不在里面。链上后面的
+	// 插件看到的是前面插件累积后的结果，可以覆盖同名的项。
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // requestRewrite 是 onRequest 的输出。未给出的字段保持原值。
@@ -20,6 +28,9 @@ type requestRewrite struct {
 	Model *string `json:"model,omitempty"`
 	// Body 非空时替换请求体。
 	Body json.RawMessage `json:"body,omitempty"`
+	// Headers 是要加给上游的请求头，同名时覆盖前面插件写的。
+	// 头名为空的项忽略。
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // responsePayload 是 onResponse 的输入。
@@ -101,6 +112,18 @@ func mergeRequest(payload, rewrite []byte) ([]byte, error) {
 	if len(change.Body) > 0 {
 		current.Body = change.Body
 		changed = true
+	}
+	if len(change.Headers) > 0 {
+		if current.Headers == nil {
+			current.Headers = make(map[string]string, len(change.Headers))
+		}
+		for name, value := range change.Headers {
+			if strings.TrimSpace(name) == "" {
+				continue
+			}
+			current.Headers[name] = value
+			changed = true
+		}
 	}
 	if !changed {
 		return nil, nil
