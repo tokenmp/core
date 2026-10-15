@@ -18,8 +18,27 @@ import (
 // maxErrorBodyBytes 是记入日志的上游错误响应上限。
 const maxErrorBodyBytes = 8 << 10
 
+// endpoint 描述这个入口在转发流程里的形状。零值是方言自己的主端点：不追加路径
+// 后缀，也不限定候选方言。
+//
+// 同一个方言上有多条端点时靠它区分：计数端点与 Messages 共用一套请求体形状，
+// 但发往上游的路径不同，服务它的候选方言也不同。
+type endpoint struct {
+	// suffix 追加在解析出的上游路径之后，用于同一个方言下的子端点。为空表示不追加。
+	suffix string
+	// dialectOnly 限定只有这个方言的候选能服务这个入口。空串表示不限定。
+	dialectOnly dialect.Name
+}
+
 // forward 是转发主流程：改写请求、选路、调用上游、写回响应。
-func (s *Server) forward(writer http.ResponseWriter, request *http.Request, client dialect.Name, pathModel string, streamHint bool) {
+func (s *Server) forward(
+	writer http.ResponseWriter,
+	request *http.Request,
+	client dialect.Name,
+	pathModel string,
+	streamHint bool,
+	shape endpoint,
+) {
 	ctx := request.Context()
 	body, ok := s.readBody(writer, request)
 	if !ok {
@@ -58,9 +77,29 @@ func (s *Server) forward(writer http.ResponseWriter, request *http.Request, clie
 			fmt.Sprintf("没有匹配模型 %s 的路由", model))
 		return
 	}
-	plan := s.planAffinity(request, client, body, routes)
+	if shape.dialectOnly != "" {
+		// 这个入口只有一种方言的候选服务得了。模型的候选里一条都没有时回 501
+		// 而不是 404：模型是配了的，缺的是这个入口要的那种渠道，两者的排查方向
+		// 不同。客户端对计数端点的 501 有自己的降级路径，因此这里不会让它退出。
+		if routes = onlyDialect(routes, shape.dialectOnly); len(routes) == 0 {
+			s.logger.Warn("模型没有该入口可用的候选渠道",
+				"request_id", requestIDOf(ctx),
+				"model", model,
+				"dialect", shape.dialectOnly)
+			s.writeError(ctx, writer, http.StatusNotImplemented, "not_supported",
+				fmt.Sprintf("模型 %s 的候选里没有 %s 方言的渠道，该端点由上游计算，本网关不本地估算",
+					model, shape.dialectOnly))
+			return
+		}
+	}
+	// 亲和只在方言自己的主端点上参与：计数这类子端点不写上游缓存，没有可粘的理由，
+	// 因此既不按会话重排候选，也不往前缀链里记一笔。
+	plan := affinityPlan{routes: routes}
+	if shape.main() {
+		plan = s.planAffinity(request, client, body, routes)
+	}
 
-	response, prepared, route := s.callUpstream(ctx, writer, request, client, model, stream, body, plan.routes)
+	response, prepared, route := s.callUpstream(ctx, writer, request, client, model, stream, body, plan.routes, shape)
 	if response == nil {
 		return
 	}
@@ -74,6 +113,20 @@ func (s *Server) forward(writer http.ResponseWriter, request *http.Request, clie
 		s.affinityTable.Remember(plan.chain, route.Channel)
 	}
 	s.writeUpstream(writer, request, client, model, route, prepared, response)
+}
+
+// main 报告这个入口是不是方言自己的主端点。主端点之外的都是子端点。
+func (e endpoint) main() bool { return e.suffix == "" }
+
+// onlyDialect 只留下给定方言的候选。一条都没有时返回空切片。
+func onlyDialect(routes []config.Route, name dialect.Name) []config.Route {
+	kept := make([]config.Route, 0, len(routes))
+	for _, route := range routes {
+		if route.Dialect == name {
+			kept = append(kept, route)
+		}
+	}
+	return kept
 }
 
 // usableRoutes 过滤掉模型名不适合写进上游路径的路由。
@@ -115,6 +168,7 @@ func (s *Server) callUpstream(
 	stream bool,
 	body []byte,
 	routes []config.Route,
+	shape endpoint,
 ) (*http.Response, *relay.Prepared, config.Route) {
 	// 宿主按请求设的上游头只取一次，候选换渠道时不变。
 	hostHeaders := s.upstreamHeaders(ctx)
@@ -146,11 +200,12 @@ func (s *Server) callUpstream(
 		// 因此 Send 返回时读它是安全的，不需要锁。
 		retries := 0
 		response, err := upstream.Send(ctx, channel.Request{
-			Dialect: route.Dialect,
-			Model:   route.Upstream,
-			Stream:  prepared.Stream,
-			Body:    prepared.Body,
-			Header:  headers,
+			Dialect:    route.Dialect,
+			Model:      route.Upstream,
+			Stream:     prepared.Stream,
+			Body:       prepared.Body,
+			Header:     headers,
+			PathSuffix: shape.suffix,
 			OnRetry: func(info channel.RetryInfo) {
 				retries = info.Attempt
 				s.logger.Debug("渠道内重试",

@@ -236,6 +236,48 @@ func TestClientBasePathAndGeminiPath(t *testing.T) {
 	}
 }
 
+func TestClientPathSuffixFollowsResolvedPath(t *testing.T) {
+	var gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		gotPath = request.URL.Path
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cases := []struct {
+		name string
+		spec channel.Spec
+		want string
+	}{
+		{
+			"追加在方言默认路径之后",
+			channel.Spec{Name: "a", Dialect: dialect.ClaudeMessages, BaseURL: server.URL},
+			"/v1/messages/count_tokens",
+		},
+		{
+			// 渠道把消息路径改写过了（例如基址自带 /api/v1），子端点跟着改写后的
+			// 路径走，而不是回到方言默认值上。
+			"追加在渠道 path 之后",
+			channel.Spec{Name: "b", Dialect: dialect.ClaudeMessages, BaseURL: server.URL, Path: "/messages"},
+			"/messages/count_tokens",
+		},
+	}
+	for _, item := range cases {
+		client, err := channel.NewClient(item.spec)
+		if err != nil {
+			t.Fatalf("%s: 创建客户端失败: %v", item.name, err)
+		}
+		response, err := client.Send(context.Background(), channel.Request{PathSuffix: "/count_tokens"})
+		if err != nil {
+			t.Fatalf("%s: 请求失败: %v", item.name, err)
+		}
+		_ = response.Body.Close()
+		if gotPath != item.want {
+			t.Fatalf("%s: 期望 %s，实际 %s", item.name, item.want, gotPath)
+		}
+	}
+}
+
 func TestClientRetriesRetryableStatus(t *testing.T) {
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
