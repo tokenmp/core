@@ -60,6 +60,12 @@ export interface RequestPayload {
   stream: boolean;
   /** 请求体，已解析成 JSON 值。 */
   body: unknown;
+  /**
+   * 链上前面的插件已经加给上游的请求头，没有时为 undefined。
+   *
+   * 只装插件写进来的那些，客户端请求头与渠道 headers 不在这里。
+   */
+  headers?: Record<string, string>;
 }
 
 /** onRequest 的输出。未给出的字段保持原值。 */
@@ -68,6 +74,13 @@ export interface RequestRewrite {
   model?: string;
   /** 替换请求体。 */
   body?: unknown;
+  /**
+   * 加给上游的请求头，同名时覆盖前面插件写的。头名为空的项会被忽略。
+   *
+   * 优先级高于配置里的渠道 headers 与客户端按名单转发的头，低于宿主
+   * 在中间件里用 server.WithUpstreamHeader 设的头。
+   */
+  headers?: Record<string, string>;
 }
 
 /** onResponse 的输入。 */

@@ -63,7 +63,7 @@ func (s *Server) forward(
 		}
 	}
 
-	body, model = s.rewriteRequest(ctx, client, model, stream, body)
+	body, model, pluginHeaders := s.rewriteRequest(ctx, client, model, stream, body)
 	// 插件可能改过模型名，记录以改写后的为准。
 	accessOf(ctx).setModel(model)
 	accessOf(ctx).setStream(stream)
@@ -99,7 +99,7 @@ func (s *Server) forward(
 		plan = s.planAffinity(request, client, body, routes)
 	}
 
-	response, prepared, route := s.callUpstream(ctx, writer, request, client, model, stream, body, plan.routes, shape)
+	response, prepared, route := s.callUpstream(ctx, writer, request, client, model, stream, body, plan.routes, shape, pluginHeaders)
 	if response == nil {
 		return
 	}
@@ -169,6 +169,7 @@ func (s *Server) callUpstream(
 	body []byte,
 	routes []config.Route,
 	shape endpoint,
+	pluginHeaders map[string]string,
 ) (*http.Response, *relay.Prepared, config.Route) {
 	// 宿主按请求设的上游头只取一次，候选换渠道时不变。
 	hostHeaders := s.upstreamHeaders(ctx)
@@ -181,7 +182,7 @@ func (s *Server) callUpstream(
 			accessOf(ctx).recordAttempt(route, 0, FailureChannel, 0, s.now().Sub(started))
 			continue
 		}
-		headers := s.forwardHeaders(request, route.Channel, upstream.Spec().Headers, hostHeaders)
+		headers := s.forwardHeaders(request, route.Channel, upstream.Spec().Headers, pluginHeaders, hostHeaders)
 		prepared, err := s.engine.PrepareRequest(ctx, relay.Request{
 			From:          client,
 			To:            route.Dialect,
@@ -276,8 +277,8 @@ func (s *Server) callUpstream(
 }
 
 // forwardHeaders 组装这次上游请求的头，优先级从低到高是：客户端按渠道放行名单
-// 转发的头、渠道 headers、宿主 WithUpstreamHeader 设的头。也就是「越具体越晚写」，
-// 与 channel/attempt 里先写 spec.Headers 再写请求级头是同一条口径。
+// 转发的头、渠道 headers、插件按请求加的头、宿主 WithUpstreamHeader 设的头。也就是
+// 「越具体越晚写」，与 channel/attempt 里先写 spec.Headers 再写请求级头是同一条口径。
 //
 // 名单里的头把客户端的所有值都带上：http.Header 支持多值，Cookie 这类重复字段的
 // 头是合法写法。名单为空的渠道只带渠道头与宿主头，与没有放行功能时逐条相同。
@@ -285,6 +286,7 @@ func (s *Server) forwardHeaders(
 	request *http.Request,
 	channelName string,
 	channelHeaders map[string]string,
+	pluginHeaders map[string]string,
 	host http.Header,
 ) http.Header {
 	var out http.Header
@@ -303,6 +305,13 @@ func (s *Server) forwardHeaders(
 	for name, value := range channelHeaders {
 		if out == nil {
 			out = make(http.Header, len(channelHeaders))
+		}
+		out.Set(name, value)
+	}
+	// 插件按请求算出来的头比配置里的渠道头具体，同名时插件赢。
+	for name, value := range pluginHeaders {
+		if out == nil {
+			out = make(http.Header, len(pluginHeaders))
 		}
 		out.Set(name, value)
 	}
@@ -383,9 +392,11 @@ func (s *Server) writeBuffered(
 }
 
 // rewriteRequest 依次调用启用插件的请求钩子。没有插件参与时不动原始字节。
-func (s *Server) rewriteRequest(ctx context.Context, client dialect.Name, model string, stream bool, body []byte) ([]byte, string) {
+//
+// 返回值里的 headers 是插件加给上游的请求头，没有插件加过时为 nil。
+func (s *Server) rewriteRequest(ctx context.Context, client dialect.Name, model string, stream bool, body []byte) ([]byte, string, map[string]string) {
 	if !s.plugins.HasAny(plugin.HookRequest) {
-		return body, model
+		return body, model, nil
 	}
 	payload, err := json.Marshal(requestPayload{
 		Dialect: string(client),
@@ -395,16 +406,16 @@ func (s *Server) rewriteRequest(ctx context.Context, client dialect.Name, model 
 	})
 	if err != nil {
 		s.logger.Warn("构造请求钩子负载失败", "request_id", requestIDOf(ctx), "error", err.Error())
-		return body, model
+		return body, model, nil
 	}
 	outcome := s.plugins.Apply(ctx, plugin.HookRequest, payload, mergeRequest, nil, s.session())
 	if !outcome.Changed() {
-		return body, model
+		return body, model, nil
 	}
 	var final requestPayload
 	if err := json.Unmarshal(outcome.Data, &final); err != nil {
 		s.logger.Warn("解析请求钩子输出失败", "request_id", requestIDOf(ctx), "plugins", outcome.Applied, "error", err.Error())
-		return body, model
+		return body, model, nil
 	}
 	updated := body
 	if len(final.Body) > 0 {
@@ -414,7 +425,7 @@ func (s *Server) rewriteRequest(ctx context.Context, client dialect.Name, model 
 		model = final.Model
 	}
 	s.logger.Debug("请求钩子生效", "request_id", requestIDOf(ctx), "plugins", outcome.Applied, "model", model)
-	return updated, model
+	return updated, model, final.Headers
 }
 
 // rewriteResponse 依次调用启用插件的响应钩子。

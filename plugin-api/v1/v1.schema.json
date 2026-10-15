@@ -38,7 +38,7 @@
     },
     "onRequest": {
       "type": "function",
-      "description": "选路之前改写请求。输入 {dialect, model, stream, body}，输出 {model?, body?}。"
+      "description": "选路之前改写请求。输入 {dialect, model, stream, body, headers?}，输出 {model?, body?, headers?}。"
     },
     "onResponse": {
       "type": "function",

@@ -53,7 +53,7 @@ export function onResponse(input) {
 
 | 钩子 | 时机 | 输入 | 输出 |
 | --- | --- | --- | --- |
-| `onRequest` | 选路之前 | `{dialect, model, stream, body}` | `{model?, body?}` |
+| `onRequest` | 选路之前 | `{dialect, model, stream, body, headers?}` | `{model?, body?, headers?}` |
 | `onResponse` | 非流式响应写回之前 | `{dialect, model, body}` | `{body?}` |
 | `onEvent` | 每条流式事件写回之前 | `{dialect, event, data}` | `{event?, data?}` |
 | `onStreamEnd` | 流结束、终止帧写出之前 | `{dialect, model, usage, events}` | `{events?}` |
@@ -62,6 +62,14 @@ export function onResponse(input) {
 
 `onRequest` 在选路之前执行，此时还没有渠道，因此它不能按渠道限定。
 它改写 `model` 会改变后续选路。
+
+它返回的 `headers` 是加给上游请求的头，用来补上游要求而客户端不发的头，比如
+按会话粘住后端的路由头。它与客户端按 `pass_headers` 转发的头、渠道 `headers`
+写在同一份请求头里，四者的优先级从低到高是：客户端转发的头、渠道 `headers`、
+插件加的头、宿主 `WithUpstreamHeader` 设的头。链上后面的插件拿到的是前面插件
+累积后的 `headers`，因此可以覆盖同名的项。
+
+插件只能加头，不能删头：值里写了空字符串就送一个空值，不会把已有的头去掉。
 
 多个插件同时启用时，下一个插件拿到的是上一个插件改写之后的完整负载，
 而不是只拿到它返回的那几个字段，因此 `dialect`、`model`、`stream` 始终可读。

@@ -231,10 +231,11 @@ channels:
 一视同仁。要按请求给上游加 `anthropic-workspace-id`，用宿主侧的
 `server.WithUpstreamHeader`，或写进顶层账号的 `headers`。
 
-同名头的优先级从低到高是：客户端按名单转发来的头、渠道 `headers`、
-宿主 `WithUpstreamHeader` 设的头。也就是越具体越晚写，宿主赢，渠道 `headers`
-赢过客户端转发的同名头。转发按 `http.Header` 的多值语义走，名单里的头把客户端的
-所有值都带上，`Cookie` 这类重复字段的头是合法写法。
+同名头的优先级从低到高是：客户端按名单转发来的头、渠道 `headers`、插件
+`onRequest` 返回的头、宿主 `WithUpstreamHeader` 设的头。也就是越具体越晚写，
+宿主赢，插件赢过渠道 `headers`，渠道 `headers` 又赢过客户端转发的同名头。转发按
+`http.Header` 的多值语义走，名单里的头把客户端的所有值都带上，`Cookie` 这类重复
+字段的头是合法写法。插件加头详见 [plugin.md](plugin.md)。
 
 两份可以直接复制的推荐名单，数据来自中转层 new-api 的按客户端透传清单。
 Claude Code：
